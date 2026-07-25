@@ -1,0 +1,6 @@
+.env
+state/
+ebiii
+*.exe
+*.test
+*.out
