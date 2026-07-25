@@ -21,6 +21,7 @@ func TestBuildArgs(t *testing.T) {
 		cwd           string
 		writableRoots []string
 		model         string
+		instructions  string
 		want          []string
 	}{
 		{
@@ -31,6 +32,19 @@ func TestBuildArgs(t *testing.T) {
 				"exec", "--json", "--skip-git-repo-check",
 				"-c", `sandbox_mode="read-only"`,
 				"-c", `approval_policy="never"`,
+				"-C", "/work", "-",
+			},
+		},
+		{
+			name:         "developer instructions are quoted",
+			sandbox:      "read-only",
+			cwd:          "/work",
+			instructions: "絶対ルール\n\"quoted\"",
+			want: []string{
+				"exec", "--json", "--skip-git-repo-check",
+				"-c", `sandbox_mode="read-only"`,
+				"-c", `approval_policy="never"`,
+				"-c", `developer_instructions="絶対ルール\n\"quoted\""`,
 				"-C", "/work", "-",
 			},
 		},
@@ -81,7 +95,7 @@ func TestBuildArgs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := buildArgs(tt.threadID, tt.sandbox, tt.cwd, tt.writableRoots, tt.model)
+			got := buildArgs(tt.threadID, tt.sandbox, tt.cwd, tt.writableRoots, tt.model, tt.instructions)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("buildArgs() = %#v, want %#v", got, tt.want)
 			}

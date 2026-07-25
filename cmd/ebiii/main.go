@@ -13,6 +13,7 @@ import (
 	"github.com/n-seiji/ebiii/internal/codex"
 	"github.com/n-seiji/ebiii/internal/config"
 	"github.com/n-seiji/ebiii/internal/playbook"
+	"github.com/n-seiji/ebiii/internal/policy"
 	"github.com/n-seiji/ebiii/internal/slackbot"
 	"github.com/n-seiji/ebiii/internal/state"
 )
@@ -38,7 +39,11 @@ func main() {
 		playbooks = nil
 	}
 
-	runner := &codex.Runner{Command: cfg.CodexCommand, Model: cfg.CodexModel}
+	runner := &codex.Runner{
+		Command:               cfg.CodexCommand,
+		Model:                 cfg.CodexModel,
+		DeveloperInstructions: policy.Instructions(),
+	}
 	bot := slackbot.New(nil, store, runner, slackbot.Config{
 		AllowedUserIDs:    cfg.AllowedUserIDs,
 		AllowedChannelIDs: cfg.AllowedChannelIDs,

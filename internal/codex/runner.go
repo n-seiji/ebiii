@@ -27,6 +27,11 @@ const (
 type Runner struct {
 	Command string
 	Model   string
+	// DeveloperInstructions is injected into each session with the
+	// "developer" role, which outranks user messages and AGENTS.md in the
+	// model's chain of command. Codex stores it once per thread, so passing
+	// it again on resume does not duplicate it.
+	DeveloperInstructions string
 }
 
 // TurnResult is the outcome reported by one Codex CLI turn.
@@ -45,7 +50,7 @@ func (r *Runner) Run(
 	prompt string,
 	onThreadStarted func(id string) error,
 ) (*TurnResult, error) {
-	args := buildArgs(threadID, sandbox, cwd, writableRoots, r.Model)
+	args := buildArgs(threadID, sandbox, cwd, writableRoots, r.Model, r.DeveloperInstructions)
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -91,7 +96,7 @@ func (r *Runner) Run(
 	return result, nil
 }
 
-func buildArgs(threadID, sandbox, cwd string, writableRoots []string, model string) []string {
+func buildArgs(threadID, sandbox, cwd string, writableRoots []string, model, developerInstructions string) []string {
 	args := []string{"exec"}
 	if threadID != "" {
 		args = append(args, "resume", threadID)
@@ -102,6 +107,9 @@ func buildArgs(threadID, sandbox, cwd string, writableRoots []string, model stri
 		"-c", fmt.Sprintf("sandbox_mode=%q", sandbox),
 		"-c", `approval_policy="never"`,
 	)
+	if developerInstructions != "" {
+		args = append(args, "-c", "developer_instructions="+strconv.Quote(developerInstructions))
+	}
 	if sandbox == "workspace-write" {
 		args = append(args, "-c", "sandbox_workspace_write.network_access=true")
 		if len(writableRoots) > 0 {

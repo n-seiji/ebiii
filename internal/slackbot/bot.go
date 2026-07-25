@@ -6,12 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/n-seiji/ebiii/internal/codex"
+	"github.com/n-seiji/ebiii/internal/memory"
 	"github.com/n-seiji/ebiii/internal/playbook"
 	"github.com/n-seiji/ebiii/internal/prompt"
 	"github.com/n-seiji/ebiii/internal/state"
@@ -143,16 +143,20 @@ func (b *Bot) HandleMention(ctx context.Context, event *slackevents.AppMentionEv
 
 	lock := b.threadLock(threadKey)
 	lock.Lock()
-	b.memoryMu.RLock()
 	threadID, _ := b.store.GetThread(threadKey)
-	planPrompt := prompt.BuildPlanPrompt(filepath.Join(b.config.MemoryDir, "MEMORY.md"), b.playbooks, message)
+	b.memoryMu.RLock()
+	memoryContent, memErr := memory.Read(b.config.MemoryDir)
+	b.memoryMu.RUnlock()
+	if memErr != nil {
+		log.Printf("slackbot: read memory: %v", memErr)
+	}
+	planPrompt := prompt.BuildPlanPrompt(memoryContent, b.playbooks, message)
 	planResult, runErr := b.runTurn(ctx, threadID, "read-only", b.config.EBIIIHome, nil, planPrompt, func(id string) error {
 		if err := b.store.SetThread(threadKey, id); err != nil {
 			return fmt.Errorf("persist plan thread: %w", err)
 		}
 		return nil
 	})
-	b.memoryMu.RUnlock()
 	lock.Unlock()
 
 	if runErr != nil || planResult == nil || !planResult.Completed {
@@ -201,12 +205,30 @@ func (b *Bot) HandleMention(ctx context.Context, event *slackevents.AppMentionEv
 		return
 	}
 
-	// Lock ordering is always workMu then memoryMu write lock.
+	// workMu serializes work turns and the memory append that follows them.
+	// memoryMu is only held around the memory access itself, so a plan turn can
+	// read memory while a work turn runs; when both are needed the order is
+	// always workMu then memoryMu. The memory directory is intentionally not a
+	// writable root: the agent proposes memory entries through the output
+	// contract and the bot writes them.
 	b.workMu.Lock()
-	b.memoryMu.Lock()
-	workPrompt := prompt.BuildWorkPrompt(instruction, filepath.Join(b.config.MemoryDir, "MEMORY.md"))
-	workResult, workErr := b.runTurn(ctx, "", "workspace-write", b.config.WorkspaceDir, []string{b.config.MemoryDir}, workPrompt, nil)
-	b.memoryMu.Unlock()
+	workPrompt := prompt.BuildWorkPrompt(instruction)
+	workResult, workErr := b.runTurn(ctx, "", "workspace-write", b.config.WorkspaceDir, nil, workPrompt, nil)
+	var resultText, memoryEntry string
+	if workErr == nil && workResult != nil && workResult.Completed && len(workResult.Messages) > 0 {
+		resultText, memoryEntry = codex.SplitMemoryAppend(workResult.Messages[len(workResult.Messages)-1])
+		if memoryEntry != "" {
+			b.memoryMu.Lock()
+			written, err := memory.Append(b.config.MemoryDir, memoryEntry)
+			b.memoryMu.Unlock()
+			if err != nil {
+				log.Printf("slackbot: append memory %q: %v", eventKey, err)
+				memoryEntry = ""
+			} else {
+				memoryEntry = written
+			}
+		}
+	}
 	b.workMu.Unlock()
 
 	if workErr != nil || workResult == nil || !workResult.Completed || len(workResult.Messages) == 0 {
@@ -216,7 +238,12 @@ func (b *Bot) HandleMention(ctx context.Context, event *slackevents.AppMentionEv
 		b.fail(ctx, eventKey, state.Working, state.Interrupted, event.Channel, threadTS, event.TimeStamp, workFailureMessage)
 		return
 	}
-	resultText := workResult.Messages[len(workResult.Messages)-1]
+	if resultText == "" {
+		resultText = "作業が完了しました。"
+	}
+	if memoryEntry != "" {
+		resultText += "\n\n📝 メモリに追記しました:\n" + memoryEntry
+	}
 	if err := b.post(ctx, event.Channel, threadTS, resultText); err != nil {
 		log.Printf("slackbot: post work result %q: %v", eventKey, err)
 		b.fail(ctx, eventKey, state.Working, state.Interrupted, event.Channel, threadTS, event.TimeStamp, workFailureMessage)

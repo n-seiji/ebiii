@@ -8,6 +8,7 @@ import (
 const (
 	policyHeading      = "## 方針"
 	instructionHeading = "## 作業指示"
+	memoryHeading      = "## メモリ追記"
 )
 
 // ParsePlan extracts the policy and work instruction from a plan response.
@@ -16,14 +17,16 @@ func ParsePlan(text string) (string, string, error) {
 	var policyIndexes, instructionIndexes []int
 	inFence := false
 	var fence byte
+	var fenceLen int
 
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if marker, ok := fenceMarker(trimmed); ok {
+		if marker, length, ok := fenceMarker(trimmed); ok {
 			if !inFence {
 				inFence = true
 				fence = marker
-			} else if marker == fence {
+				fenceLen = length
+			} else if marker == fence && length >= fenceLen {
 				inFence = false
 			}
 			continue
@@ -59,14 +62,59 @@ func ParsePlan(text string) (string, string, error) {
 	return policy, instruction, nil
 }
 
-func fenceMarker(line string) (byte, bool) {
+// SplitMemoryAppend separates an optional trailing memory-append section from
+// a work response. When the section is absent or ambiguous (zero or multiple
+// headings), the original text is returned unchanged with an empty entry so
+// no memory write happens.
+func SplitMemoryAppend(text string) (rest, entry string) {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	var indexes []int
+	inFence := false
+	var fence byte
+	var fenceLen int
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if marker, length, ok := fenceMarker(trimmed); ok {
+			if !inFence {
+				inFence = true
+				fence = marker
+				fenceLen = length
+			} else if marker == fence && length >= fenceLen {
+				inFence = false
+			}
+			continue
+		}
+		if inFence {
+			continue
+		}
+		if trimmed == memoryHeading {
+			indexes = append(indexes, i)
+		}
+	}
+
+	if len(indexes) != 1 {
+		return text, ""
+	}
+	index := indexes[0]
+	rest = strings.TrimSpace(strings.Join(lines[:index], "\n"))
+	entry = strings.TrimSpace(strings.Join(lines[index+1:], "\n"))
+	return rest, entry
+}
+
+// fenceMarker reports the fence character and the number of times it is
+// repeated at the start of line. A closing fence must use the same character
+// as its opening fence and be at least as long.
+func fenceMarker(line string) (char byte, length int, ok bool) {
 	if len(line) < 3 || (line[0] != '`' && line[0] != '~') {
-		return 0, false
+		return 0, 0, false
 	}
-	marker := line[0]
-	count := 0
-	for count < len(line) && line[count] == marker {
-		count++
+	char = line[0]
+	for length < len(line) && line[length] == char {
+		length++
 	}
-	return marker, count >= 3
+	if length < 3 {
+		return 0, 0, false
+	}
+	return char, length, true
 }

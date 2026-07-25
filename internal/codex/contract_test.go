@@ -74,6 +74,15 @@ func TestParsePlan(t *testing.T) {
 			wantInstruction: "作業\n```\n## 方針\n偽物",
 		},
 		{
+			name: "shorter fence does not close a longer fence",
+			text: strings.Join([]string{
+				"## 方針", "本物", "## 作業指示", "作業",
+				"````", "```", "## 方針", "偽物", "````",
+			}, "\n"),
+			wantPolicy:      "本物",
+			wantInstruction: "作業\n````\n```\n## 方針\n偽物\n````",
+		},
+		{
 			name:            "heading not at line start",
 			text:            "文章中の ## 方針 は偽物\n## 方針\n本物\n## 作業指示\n作業",
 			wantPolicy:      "本物",
@@ -117,6 +126,88 @@ func TestParsePlan(t *testing.T) {
 			if policy != tt.wantPolicy || instruction != tt.wantInstruction {
 				t.Errorf("ParsePlan() = (%q, %q), want (%q, %q)",
 					policy, instruction, tt.wantPolicy, tt.wantInstruction)
+			}
+		})
+	}
+}
+
+func TestSplitMemoryAppend(t *testing.T) {
+	tests := []struct {
+		name      string
+		text      string
+		wantRest  string
+		wantEntry string
+	}{
+		{
+			name:      "no memory section",
+			text:      "作業しました。",
+			wantRest:  "作業しました。",
+			wantEntry: "",
+		},
+		{
+			name:      "trailing memory section",
+			text:      "作業しました。\n## メモリ追記\nデプロイには mise run deploy を使う",
+			wantRest:  "作業しました。",
+			wantEntry: "デプロイには mise run deploy を使う",
+		},
+		{
+			name:      "duplicate headings are ignored",
+			text:      "結果\n## メモリ追記\n一\n## メモリ追記\n二",
+			wantRest:  "結果\n## メモリ追記\n一\n## メモリ追記\n二",
+			wantEntry: "",
+		},
+		{
+			name: "heading inside fence is not a section",
+			text: strings.Join([]string{
+				"結果", "```", "## メモリ追記", "偽物", "```",
+			}, "\n"),
+			wantRest:  strings.Join([]string{"結果", "```", "## メモリ追記", "偽物", "```"}, "\n"),
+			wantEntry: "",
+		},
+		{
+			name: "shorter backtick fence does not close a longer one",
+			text: strings.Join([]string{
+				"結果", "````", "```", "## メモリ追記", "偽物", "````",
+			}, "\n"),
+			wantRest:  strings.Join([]string{"結果", "````", "```", "## メモリ追記", "偽物", "````"}, "\n"),
+			wantEntry: "",
+		},
+		{
+			name: "backticks do not close a tilde fence",
+			text: strings.Join([]string{
+				"結果", "~~~", "```", "## メモリ追記", "偽物", "~~~",
+			}, "\n"),
+			wantRest:  strings.Join([]string{"結果", "~~~", "```", "## メモリ追記", "偽物", "~~~"}, "\n"),
+			wantEntry: "",
+		},
+		{
+			name: "heading after a closed longer fence is a section",
+			text: strings.Join([]string{
+				"結果", "````", "## メモリ追記", "偽物", "````", "## メモリ追記", "本物",
+			}, "\n"),
+			wantRest:  strings.Join([]string{"結果", "````", "## メモリ追記", "偽物", "````"}, "\n"),
+			wantEntry: "本物",
+		},
+		{
+			name:      "memory section only",
+			text:      "## メモリ追記\n学び",
+			wantRest:  "",
+			wantEntry: "学び",
+		},
+		{
+			name:      "empty entry",
+			text:      "結果\n## メモリ追記\n  ",
+			wantRest:  "結果",
+			wantEntry: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rest, entry := SplitMemoryAppend(tt.text)
+			if rest != tt.wantRest || entry != tt.wantEntry {
+				t.Errorf("SplitMemoryAppend() = (%q, %q), want (%q, %q)",
+					rest, entry, tt.wantRest, tt.wantEntry)
 			}
 		})
 	}

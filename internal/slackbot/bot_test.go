@@ -3,6 +3,8 @@ package slackbot
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -106,12 +108,16 @@ type fakeRunner struct {
 	mu        sync.Mutex
 	responses []runnerResponse
 	calls     int
+	roots     [][]string
+	prompts   []string
 }
 
-func (r *fakeRunner) Run(_ context.Context, _ string, _ string, _ string, _ []string, _ string, callback func(string) error) (*codex.TurnResult, error) {
+func (r *fakeRunner) Run(_ context.Context, _ string, _ string, _ string, roots []string, prompt string, callback func(string) error) (*codex.TurnResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls++
+	r.roots = append(r.roots, roots)
+	r.prompts = append(r.prompts, prompt)
 	if callback != nil {
 		if err := callback("plan-thread"); err != nil {
 			return nil, err
@@ -122,12 +128,13 @@ func (r *fakeRunner) Run(_ context.Context, _ string, _ string, _ string, _ []st
 	return response.result, response.err
 }
 
-func newTestBot(store *fakeStore, api *fakeSlack, runner *fakeRunner) *Bot {
+func newTestBot(t *testing.T, store *fakeStore, api *fakeSlack, runner *fakeRunner) *Bot {
+	t.Helper()
 	return New(api, store, runner, Config{
 		AllowedUserIDs: []string{"U1"},
 		EBIIIHome:      "/repo",
 		WorkspaceDir:   "/repo/workspace",
-		MemoryDir:      "/repo/memory",
+		MemoryDir:      filepath.Join(t.TempDir(), "memory"),
 		CodexTimeout:   time.Minute,
 		BotUserID:      "UBOT",
 	}, nil)
@@ -165,7 +172,7 @@ func TestAllowlistRejectsUserAndChannel(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			store := &fakeStore{claim: true}
-			bot := newTestBot(store, &fakeSlack{}, &fakeRunner{})
+			bot := newTestBot(t, store, &fakeSlack{}, &fakeRunner{})
 			if test.configure != nil {
 				test.configure(bot)
 			}
@@ -181,7 +188,7 @@ func TestDuplicateEventIsSkipped(t *testing.T) {
 	store := &fakeStore{claim: false}
 	runner := &fakeRunner{}
 	api := &fakeSlack{}
-	newTestBot(store, api, runner).HandleMention(context.Background(), mention())
+	newTestBot(t, store, api, runner).HandleMention(context.Background(), mention())
 	if runner.calls != 0 || len(api.calls) != 0 {
 		t.Fatalf("duplicate event caused runner=%d Slack calls=%d", runner.calls, len(api.calls))
 	}
@@ -209,7 +216,7 @@ func TestFailClosedTransitionsToDoneWithCheckmark(t *testing.T) {
 			store := &fakeStore{claim: true}
 			api := &fakeSlack{}
 			runner := &fakeRunner{responses: []runnerResponse{{result: test.result}}}
-			newTestBot(store, api, runner).HandleMention(context.Background(), mention())
+			newTestBot(t, store, api, runner).HandleMention(context.Background(), mention())
 			if store.current != state.Done {
 				t.Fatalf("state = %q, want done", store.current)
 			}
@@ -232,7 +239,7 @@ func TestNoneTransitionsToDoneWithCheckmark(t *testing.T) {
 		Completed: true,
 		Messages:  []string{"## 方針\nNo work needed.\n## 作業指示\nNONE"},
 	}}}}
-	newTestBot(store, api, runner).HandleMention(context.Background(), mention())
+	newTestBot(t, store, api, runner).HandleMention(context.Background(), mention())
 	assertTransitions(t, store.transitions, [][2]state.State{
 		{state.Received, state.Planning},
 		{state.Planning, state.PlanPosted},
@@ -251,7 +258,7 @@ func TestPlanWorkDone(t *testing.T) {
 		}},
 		{result: &codex.TurnResult{Completed: true, Messages: []string{"Work completed."}}},
 	}}
-	newTestBot(store, api, runner).HandleMention(context.Background(), mention())
+	newTestBot(t, store, api, runner).HandleMention(context.Background(), mention())
 	assertTransitions(t, store.transitions, [][2]state.State{
 		{state.Received, state.Planning},
 		{state.Planning, state.PlanPosted},
@@ -264,7 +271,73 @@ func TestPlanWorkDone(t *testing.T) {
 	if got := strings.Join(api.postTexts, "|"); got != "Implement safely.|Work completed." {
 		t.Fatalf("posts = %q", got)
 	}
+	if runner.roots[0] != nil || runner.roots[1] != nil {
+		t.Fatalf("writable roots = %v, want no writable roots for either turn", runner.roots)
+	}
 	assertFinalReactionOrder(t, api.calls, "white_check_mark")
+}
+
+func TestPlanPromptInjectsMemoryContent(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{}
+	runner := &fakeRunner{responses: []runnerResponse{{result: &codex.TurnResult{
+		Completed: true,
+		Messages:  []string{"## 方針\nNo work needed.\n## 作業指示\nNONE"},
+	}}}}
+	bot := newTestBot(t, store, api, runner)
+	if err := os.MkdirAll(bot.config.MemoryDir, 0o755); err != nil {
+		t.Fatalf("mkdir memory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bot.config.MemoryDir, "MEMORY.md"), []byte("# Memory\n重要な学び"), 0o644); err != nil {
+		t.Fatalf("write memory: %v", err)
+	}
+	bot.HandleMention(context.Background(), mention())
+	if len(runner.prompts) != 1 {
+		t.Fatalf("runner prompts = %d, want 1", len(runner.prompts))
+	}
+	prompt := runner.prompts[0]
+	for _, want := range []string{"<memory>", "重要な学び", "</memory>"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("plan prompt does not contain %q", want)
+		}
+	}
+	if strings.Contains(prompt, "MEMORY.md") {
+		t.Error("plan prompt should inject memory content, not the file path")
+	}
+}
+
+func TestWorkMemoryAppendIsWrittenByBot(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{}
+	runner := &fakeRunner{responses: []runnerResponse{
+		{result: &codex.TurnResult{
+			Completed: true,
+			Messages:  []string{"## 方針\nDo work.\n## 作業指示\nMake a change."},
+		}},
+		{result: &codex.TurnResult{
+			Completed: true,
+			Messages:  []string{"Work completed.\n## メモリ追記\nビルドは mise run build を使う"},
+		}},
+	}}
+	bot := newTestBot(t, store, api, runner)
+	bot.HandleMention(context.Background(), mention())
+	if store.current != state.Done {
+		t.Fatalf("state = %q, want done", store.current)
+	}
+	data, err := os.ReadFile(filepath.Join(bot.config.MemoryDir, "MEMORY.md"))
+	if err != nil {
+		t.Fatalf("read memory: %v", err)
+	}
+	if !strings.Contains(string(data), "ビルドは mise run build を使う") {
+		t.Fatalf("memory file = %q, want appended entry", data)
+	}
+	posts := strings.Join(api.postTexts, "|")
+	if !strings.Contains(posts, "Work completed.") || !strings.Contains(posts, "メモリに追記しました") {
+		t.Fatalf("posts = %q, want work result and memory notification", posts)
+	}
+	if strings.Contains(posts, "## メモリ追記") {
+		t.Fatalf("posts = %q, memory heading should be stripped", posts)
+	}
 }
 
 func TestWorkFailureIsInterrupted(t *testing.T) {
@@ -277,11 +350,118 @@ func TestWorkFailureIsInterrupted(t *testing.T) {
 		}},
 		{result: &codex.TurnResult{Completed: false, Err: "failed"}},
 	}}
-	newTestBot(store, api, runner).HandleMention(context.Background(), mention())
+	newTestBot(t, store, api, runner).HandleMention(context.Background(), mention())
 	if store.current != state.Interrupted {
 		t.Fatalf("state = %q, want interrupted", store.current)
 	}
 	assertFinalReactionOrder(t, api.calls, "x")
+}
+
+// blockingInstruction marks the work prompt that gatedRunner holds open.
+const blockingInstruction = "BLOCKWORK"
+
+// looseStore accepts any transition so concurrent events do not interfere.
+type looseStore struct {
+	mu      sync.Mutex
+	threads map[string]string
+}
+
+func (s *looseStore) ClaimEvent(string) (bool, error) { return true, nil }
+
+func (s *looseStore) Transition(string, state.State, state.State) error { return nil }
+
+func (s *looseStore) GetThread(key string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.threads[key]
+	return id, ok
+}
+
+func (s *looseStore) SetThread(key, threadID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.threads[key] = threadID
+	return nil
+}
+
+// gatedRunner holds the work turn open until release is closed so a test can
+// observe what other turns may run concurrently.
+type gatedRunner struct {
+	workStarted chan struct{}
+	release     chan struct{}
+	releaseOnce sync.Once
+}
+
+func (r *gatedRunner) Run(_ context.Context, _, _, _ string, _ []string, prompt string, callback func(string) error) (*codex.TurnResult, error) {
+	if callback != nil {
+		if err := callback("plan-thread"); err != nil {
+			return nil, err
+		}
+	}
+	if strings.Contains(prompt, blockingInstruction) {
+		close(r.workStarted)
+		<-r.release
+		return &codex.TurnResult{Completed: true, Messages: []string{"Work completed."}}, nil
+	}
+	if strings.Contains(prompt, "second") {
+		return &codex.TurnResult{
+			Completed: true,
+			Messages:  []string{"## 方針\nNothing to do.\n## 作業指示\nNONE"},
+		}, nil
+	}
+	return &codex.TurnResult{
+		Completed: true,
+		Messages:  []string{"## 方針\nWork on it.\n## 作業指示\n" + blockingInstruction},
+	}, nil
+}
+
+func (r *gatedRunner) releaseWork() {
+	r.releaseOnce.Do(func() { close(r.release) })
+}
+
+func TestPlanTurnRunsWhileWorkTurnIsBlocked(t *testing.T) {
+	runner := &gatedRunner{
+		workStarted: make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+	bot := New(&fakeSlack{}, &looseStore{threads: map[string]string{}}, runner, Config{
+		AllowedUserIDs: []string{"U1"},
+		EBIIIHome:      "/repo",
+		WorkspaceDir:   "/repo/workspace",
+		MemoryDir:      filepath.Join(t.TempDir(), "memory"),
+		CodexTimeout:   time.Minute,
+		BotUserID:      "UBOT",
+	}, nil)
+
+	ctx := context.Background()
+	workDone := make(chan struct{})
+	go func() {
+		defer close(workDone)
+		bot.HandleMention(ctx, mention())
+	}()
+	defer func() {
+		runner.releaseWork()
+		<-workDone
+	}()
+
+	select {
+	case <-runner.workStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("work turn did not start")
+	}
+
+	planDone := make(chan struct{})
+	go func() {
+		defer close(planDone)
+		bot.HandleMention(ctx, &slackevents.AppMentionEvent{
+			User: "U1", Channel: "C1", TimeStamp: "200.2", Text: "<@UBOT> second",
+		})
+	}()
+	select {
+	case <-planDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("plan turn did not finish while a work turn was blocked")
+	}
 }
 
 func TestSplitMessageUsesRuneBoundaries(t *testing.T) {
@@ -300,7 +480,7 @@ func TestSplitMessageUsesRuneBoundaries(t *testing.T) {
 
 func TestPostSplitsLongMessage(t *testing.T) {
 	api := &fakeSlack{}
-	bot := newTestBot(&fakeStore{}, api, &fakeRunner{})
+	bot := newTestBot(t, &fakeStore{}, api, &fakeRunner{})
 	text := strings.Repeat("界", 3901)
 	if err := bot.post(context.Background(), "C1", "1", text); err != nil {
 		t.Fatalf("post() error = %v", err)
@@ -315,7 +495,7 @@ func TestPostSplitsLongMessage(t *testing.T) {
 
 func TestPostRetriesRateLimitAfterDelay(t *testing.T) {
 	api := &fakeSlack{postErrs: []error{&slack.RateLimitedError{RetryAfter: 3 * time.Second}, nil}}
-	bot := newTestBot(&fakeStore{}, api, &fakeRunner{})
+	bot := newTestBot(t, &fakeStore{}, api, &fakeRunner{})
 	var waited time.Duration
 	bot.sleep = func(_ context.Context, duration time.Duration) error {
 		waited = duration
