@@ -106,6 +106,23 @@ func TestListExcludesOversizedFile(t *testing.T) {
 	}
 }
 
+func TestListSkipsREADME(t *testing.T) {
+	dir := t.TempDir()
+	frontmatter := "---\nname: Ignored\ndescription: README is not a playbook\n---\n"
+	for _, name := range []string{"README.md", "readme.md"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(frontmatter), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := List(dir)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("List() returned %d playbooks, want 0 (README should be skipped)", len(got))
+	}
+}
+
 func TestListEmptyDirectory(t *testing.T) {
 	got, err := List(t.TempDir())
 	if err != nil {

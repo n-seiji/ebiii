@@ -40,6 +40,10 @@ func List(dir string) ([]Playbook, error) {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" {
 			continue
 		}
+		// README.md は playbook 置き場の説明用であり playbook ではない。
+		if strings.EqualFold(entry.Name(), "README.md") {
+			continue
+		}
 
 		path := filepath.Join(absoluteDir, entry.Name())
 		info, err := entry.Info()
