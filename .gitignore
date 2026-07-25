@@ -1,6 +1,6 @@
 .env
 /state/
-ebiii
+/ebiii
 *.exe
 *.test
 *.out
