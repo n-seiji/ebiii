@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const defaultCodexTimeout = 30 * time.Minute
@@ -57,9 +58,11 @@ func Load() (*Config, error) {
 		}
 	}
 
-	codexCommand := strings.TrimSpace(os.Getenv("CODEX_COMMAND"))
+	codexCommand := os.Getenv("CODEX_COMMAND")
 	if codexCommand == "" {
 		codexCommand = "codex"
+	} else if strings.IndexFunc(codexCommand, unicode.IsSpace) >= 0 {
+		return nil, fmt.Errorf("CODEX_COMMAND %q: %w", codexCommand, errors.New("must be an executable path without whitespace"))
 	}
 
 	codexTimeout := defaultCodexTimeout

@@ -32,19 +32,19 @@ func TestLoad(t *testing.T) {
 				t.Helper()
 				wantHome := filepath.Join(workingDir, "data")
 				if !reflect.DeepEqual(cfg.AllowedUserIDs, []string{"U123", "U456"}) {
-					t.Errorf("AllowedUserIDs = %v", cfg.AllowedUserIDs)
+					t.Errorf("AllowedUserIDs = %v, want %v", cfg.AllowedUserIDs, []string{"U123", "U456"})
 				}
 				if !reflect.DeepEqual(cfg.AllowedChannelIDs, []string{"C123", "C456"}) {
-					t.Errorf("AllowedChannelIDs = %v", cfg.AllowedChannelIDs)
+					t.Errorf("AllowedChannelIDs = %v, want %v", cfg.AllowedChannelIDs, []string{"C123", "C456"})
 				}
 				if cfg.CodexCommand != "/usr/local/bin/codex" {
-					t.Errorf("CodexCommand = %q", cfg.CodexCommand)
+					t.Errorf("CodexCommand = %q, want %q", cfg.CodexCommand, "/usr/local/bin/codex")
 				}
 				if cfg.CodexModel != "gpt-test" {
-					t.Errorf("CodexModel = %q", cfg.CodexModel)
+					t.Errorf("CodexModel = %q, want %q", cfg.CodexModel, "gpt-test")
 				}
 				if cfg.CodexTimeout != 45*time.Second {
-					t.Errorf("CodexTimeout = %v", cfg.CodexTimeout)
+					t.Errorf("CodexTimeout = %v, want %v", cfg.CodexTimeout, 45*time.Second)
 				}
 				if cfg.EBIIIHome != wantHome {
 					t.Errorf("EBIIIHome = %q, want %q", cfg.EBIIIHome, wantHome)
@@ -79,6 +79,26 @@ func TestLoad(t *testing.T) {
 			wantErr: `SLACK_ALLOWED_USER_IDS: invalid user ID "W456"`,
 		},
 		{
+			name: "codex command contains whitespace",
+			env: map[string]string{
+				"SLACK_BOT_TOKEN":        "xoxb-test",
+				"SLACK_APP_TOKEN":        "xapp-test",
+				"SLACK_ALLOWED_USER_IDS": "U123",
+				"CODEX_COMMAND":          "codex --foo",
+			},
+			wantErr: "CODEX_COMMAND",
+		},
+		{
+			name: "codex command contains non-space whitespace",
+			env: map[string]string{
+				"SLACK_BOT_TOKEN":        "xoxb-test",
+				"SLACK_APP_TOKEN":        "xapp-test",
+				"SLACK_ALLOWED_USER_IDS": "U123",
+				"CODEX_COMMAND":          "codex\t--foo",
+			},
+			wantErr: "CODEX_COMMAND",
+		},
+		{
 			name: "default home and optional values",
 			env: map[string]string{
 				"SLACK_BOT_TOKEN":        "xoxb-test",
@@ -91,13 +111,13 @@ func TestLoad(t *testing.T) {
 					t.Errorf("EBIIIHome = %q, want %q", cfg.EBIIIHome, workingDir)
 				}
 				if cfg.CodexCommand != "codex" {
-					t.Errorf("CodexCommand = %q", cfg.CodexCommand)
+					t.Errorf("CodexCommand = %q, want %q", cfg.CodexCommand, "codex")
 				}
 				if cfg.CodexTimeout != 30*time.Minute {
-					t.Errorf("CodexTimeout = %v", cfg.CodexTimeout)
+					t.Errorf("CodexTimeout = %v, want %v", cfg.CodexTimeout, 30*time.Minute)
 				}
 				if len(cfg.AllowedChannelIDs) != 0 {
-					t.Errorf("AllowedChannelIDs = %v", cfg.AllowedChannelIDs)
+					t.Errorf("AllowedChannelIDs = %v, want %v", cfg.AllowedChannelIDs, []string(nil))
 				}
 				assertPaths(t, cfg, workingDir)
 			},
@@ -120,7 +140,7 @@ func TestLoad(t *testing.T) {
 			withWorkingDir(t, workingDir)
 			workingDir, err := filepath.Abs(".")
 			if err != nil {
-				t.Fatalf("resolve working directory: %v", err)
+				t.Fatalf("filepath.Abs() error = %v, want nil", err)
 			}
 			clearConfigEnv(t)
 			for key, value := range tt.env {
@@ -135,7 +155,7 @@ func TestLoad(t *testing.T) {
 				return
 			}
 			if err != nil {
-				t.Fatalf("Load() error = %v", err)
+				t.Fatalf("Load() error = %v, want nil", err)
 			}
 			tt.check(t, cfg, workingDir)
 		})
@@ -152,21 +172,21 @@ func TestLoadDotEnv(t *testing.T) {
 		"SLACK_APP_TOKEN='xapp-file'\n" +
 		"export SLACK_ALLOWED_USER_IDS=\"U123,U456\"\n"
 	if err := os.WriteFile(filepath.Join(workingDir, ".env"), []byte(content), 0o600); err != nil {
-		t.Fatalf("write .env: %v", err)
+		t.Fatalf("WriteFile() error = %v, want nil", err)
 	}
 
 	cfg, err := Load()
 	if err != nil {
-		t.Fatalf("Load() error = %v", err)
+		t.Fatalf("Load() error = %v, want nil", err)
 	}
 	if cfg.SlackBotToken != "from-environment" {
-		t.Errorf("SlackBotToken = %q", cfg.SlackBotToken)
+		t.Errorf("SlackBotToken = %q, want %q", cfg.SlackBotToken, "from-environment")
 	}
 	if cfg.SlackAppToken != "xapp-file" {
-		t.Errorf("SlackAppToken = %q", cfg.SlackAppToken)
+		t.Errorf("SlackAppToken = %q, want %q", cfg.SlackAppToken, "xapp-file")
 	}
 	if !reflect.DeepEqual(cfg.AllowedUserIDs, []string{"U123", "U456"}) {
-		t.Errorf("AllowedUserIDs = %v", cfg.AllowedUserIDs)
+		t.Errorf("AllowedUserIDs = %v, want %v", cfg.AllowedUserIDs, []string{"U123", "U456"})
 	}
 }
 
@@ -201,7 +221,7 @@ func clearConfigEnv(t *testing.T) {
 	} {
 		value, exists := os.LookupEnv(key)
 		if err := os.Unsetenv(key); err != nil {
-			t.Fatalf("unset %s: %v", key, err)
+			t.Fatalf("Unsetenv(%q) error = %v, want nil", key, err)
 		}
 		t.Cleanup(func() {
 			if exists {
@@ -217,10 +237,10 @@ func withWorkingDir(t *testing.T, dir string) {
 	t.Helper()
 	previous, err := os.Getwd()
 	if err != nil {
-		t.Fatalf("get working directory: %v", err)
+		t.Fatalf("Getwd() error = %v, want nil", err)
 	}
 	if err := os.Chdir(dir); err != nil {
-		t.Fatalf("change working directory: %v", err)
+		t.Fatalf("Chdir(%q) error = %v, want nil", dir, err)
 	}
 	t.Cleanup(func() {
 		_ = os.Chdir(previous)
