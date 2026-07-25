@@ -1,0 +1,25 @@
+[tools]
+go = "1.26"
+
+[env]
+CGO_ENABLED = "0"
+
+[tasks.build]
+description = "Build ebiii binary"
+run = "go build -o ebiii ./cmd/ebiii"
+
+[tasks.run]
+description = "Build and run ebiii"
+depends = ["build"]
+run = "./ebiii"
+
+[tasks.test]
+description = "Run tests with race detector"
+run = "go test -race ./..."
+
+[tasks.lint]
+description = "Run go vet and gofmt check"
+run = """
+go vet ./...
+test -z "$(gofmt -l .)" || { gofmt -l .; echo "gofmt: files need formatting"; exit 1; }
+"""

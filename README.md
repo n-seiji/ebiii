@@ -16,11 +16,11 @@ ebiii は、Slack の mention を受けて Codex が方針を検討し、必要�
 
 ```sh
 cp .env.example .env
-make build
-go run ./cmd/ebiii
+mise run build   # または: go build -o ebiii ./cmd/ebiii
+./ebiii
 ```
 
-テストは `make test`、vet は `make lint` で実行できます。
+Go のバージョンは [mise](https://mise.jdx.dev/) で管理しています(`mise install` で揃います)。テストは `mise run test`、lint は `mise run lint` で実行できます。mise なしでも `go build` / `go test -race ./...` / `go vet ./...` で同等です。
 
 ebiii は単一プロセスでの運用を前提としており、多重起動には対応していません。
 
