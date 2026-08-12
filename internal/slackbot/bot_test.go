@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -275,6 +276,42 @@ func TestPlanWorkDone(t *testing.T) {
 		t.Fatalf("writable roots = %v, want no writable roots for either turn", runner.roots)
 	}
 	assertFinalReactionOrder(t, api.calls, "white_check_mark")
+}
+
+func TestWorkTurnReceivesWritableRootsAndPlanTurnDoesNot(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{}
+	runner := &fakeRunner{responses: []runnerResponse{
+		{result: &codex.TurnResult{
+			Completed: true,
+			Messages:  []string{"## 方針\nDo work.\n## 作業指示\nMake a change."},
+		}},
+		{result: &codex.TurnResult{Completed: true, Messages: []string{"Work completed."}}},
+	}}
+	roots := []string{"/extra/one", "/extra/two"}
+	bot := New(api, store, runner, Config{
+		AllowedUserIDs: []string{"U1"},
+		EBIIIHome:      "/repo",
+		WorkspaceDir:   "/repo/workspace",
+		MemoryDir:      filepath.Join(t.TempDir(), "memory"),
+		CodexTimeout:   time.Minute,
+		BotUserID:      "UBOT",
+		WritableRoots:  roots,
+	}, nil)
+	// New must copy the slice, so later mutation by the caller is not observed.
+	roots[0] = "/mutated"
+
+	bot.HandleMention(context.Background(), mention())
+	if runner.calls != 2 {
+		t.Fatalf("runner calls = %d, want 2", runner.calls)
+	}
+	if runner.roots[0] != nil {
+		t.Errorf("plan turn writable roots = %v, want nil", runner.roots[0])
+	}
+	want := []string{"/extra/one", "/extra/two"}
+	if !reflect.DeepEqual(runner.roots[1], want) {
+		t.Errorf("work turn writable roots = %v, want %v", runner.roots[1], want)
+	}
 }
 
 func TestPlanPromptInjectsMemoryContent(t *testing.T) {

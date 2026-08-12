@@ -57,6 +57,8 @@ type Config struct {
 	MemoryDir         string
 	CodexTimeout      time.Duration
 	BotUserID         string
+	// WritableRoots are extra directories the work turn may write to.
+	WritableRoots []string
 }
 
 // Bot handles Slack mentions.
@@ -78,6 +80,7 @@ type Bot struct {
 
 // New constructs a Bot.
 func New(api SlackAPI, store Store, runner Runner, config Config, playbooks []playbook.Playbook) *Bot {
+	config.WritableRoots = append([]string(nil), config.WritableRoots...)
 	b := &Bot{
 		api:             api,
 		store:           store,
@@ -213,7 +216,7 @@ func (b *Bot) HandleMention(ctx context.Context, event *slackevents.AppMentionEv
 	// contract and the bot writes them.
 	b.workMu.Lock()
 	workPrompt := prompt.BuildWorkPrompt(instruction)
-	workResult, workErr := b.runTurn(ctx, "", "workspace-write", b.config.WorkspaceDir, nil, workPrompt, nil)
+	workResult, workErr := b.runTurn(ctx, "", "workspace-write", b.config.WorkspaceDir, b.config.WritableRoots, workPrompt, nil)
 	var resultText, memoryEntry string
 	if workErr == nil && workResult != nil && workResult.Completed && len(workResult.Messages) > 0 {
 		resultText, memoryEntry = codex.SplitMemoryAppend(workResult.Messages[len(workResult.Messages)-1])

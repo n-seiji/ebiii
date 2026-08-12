@@ -46,6 +46,8 @@ func TestBuildPlanPrompt(t *testing.T) {
 				"## 方針",
 				"## 作業指示",
 				"NONE という単独行のみ",
+				"読み取り専用",
+				"このターンで試さず",
 				"<user_message>",
 				"</user_message>",
 				message,

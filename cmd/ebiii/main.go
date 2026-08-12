@@ -51,6 +51,7 @@ func main() {
 		WorkspaceDir:      cfg.WorkspaceDir,
 		MemoryDir:         cfg.MemoryDir,
 		CodexTimeout:      cfg.CodexTimeout,
+		WritableRoots:     cfg.WritableRoots,
 	}, playbooks)
 
 	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

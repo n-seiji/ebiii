@@ -162,6 +162,102 @@ func TestLoad(t *testing.T) {
 	}
 }
 
+func TestResolveWritableRoots(t *testing.T) {
+	base := t.TempDir()
+	realBase, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q) error = %v, want nil", base, err)
+	}
+	target := filepath.Join(realBase, "target")
+	other := filepath.Join(realBase, "other")
+	for _, dir := range []string{target, other} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q) error = %v, want nil", dir, err)
+		}
+	}
+	link := filepath.Join(realBase, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("Symlink(%q) error = %v, want nil", link, err)
+	}
+	file := filepath.Join(realBase, "file.txt")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", file, err)
+	}
+
+	home := t.TempDir()
+	realHome, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q) error = %v, want nil", home, err)
+	}
+	homeChild := filepath.Join(realHome, "child")
+	if err := os.MkdirAll(homeChild, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v, want nil", homeChild, err)
+	}
+	t.Setenv("HOME", realHome)
+
+	tests := []struct {
+		name    string
+		in      string
+		want    []string
+		wantErr string
+	}{
+		{name: "empty", in: "  ", want: nil},
+		{name: "blank entries and trailing comma", in: target + ", ,," + other + ",", want: []string{target, other}},
+		{name: "tilde is expanded", in: "~/child", want: []string{homeChild}},
+		{name: "bare tilde is expanded", in: "~", want: []string{realHome}},
+		{name: "symlink resolves to its target", in: link, want: []string{target}},
+		{name: "duplicates after normalization are dropped", in: link + "," + target + "," + other, want: []string{target, other}},
+		{name: "missing path", in: filepath.Join(realBase, "nope"), wantErr: "nope"},
+		{name: "file is rejected", in: file, wantErr: "must be a directory"},
+		{name: "tilde user is rejected", in: "~someone/dir", wantErr: "~user expansion is not supported"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveWritableRoots(tt.in)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("resolveWritableRoots(%q) error = %v, want containing %q", tt.in, err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveWritableRoots(%q) error = %v, want nil", tt.in, err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("resolveWritableRoots(%q) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadWritableRoots(t *testing.T) {
+	workingDir := t.TempDir()
+	withWorkingDir(t, workingDir)
+	clearConfigEnv(t)
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks() error = %v, want nil", err)
+	}
+	t.Setenv("SLACK_BOT_TOKEN", "xoxb-test")
+	t.Setenv("SLACK_APP_TOKEN", "xapp-test")
+	t.Setenv("SLACK_ALLOWED_USER_IDS", "U123")
+	t.Setenv("EBIII_WRITABLE_ROOTS", root)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+	if !reflect.DeepEqual(cfg.WritableRoots, []string{root}) {
+		t.Errorf("WritableRoots = %v, want %v", cfg.WritableRoots, []string{root})
+	}
+
+	t.Setenv("EBIII_WRITABLE_ROOTS", filepath.Join(root, "missing"))
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "EBIII_WRITABLE_ROOTS") {
+		t.Fatalf("Load() error = %v, want EBIII_WRITABLE_ROOTS failure", err)
+	}
+}
+
 func TestLoadDotEnv(t *testing.T) {
 	workingDir := t.TempDir()
 	withWorkingDir(t, workingDir)
@@ -218,6 +314,7 @@ func clearConfigEnv(t *testing.T) {
 		"CODEX_MODEL",
 		"CODEX_TIMEOUT",
 		"EBIII_HOME",
+		"EBIII_WRITABLE_ROOTS",
 	} {
 		value, exists := os.LookupEnv(key)
 		if err := os.Unsetenv(key); err != nil {

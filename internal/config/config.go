@@ -28,6 +28,9 @@ type Config struct {
 	MemoryDir         string
 	PlaybooksDir      string
 	StateDir          string
+	// WritableRoots are absolute, symlink-resolved directories the work turn
+	// may write to in addition to the workspace.
+	WritableRoots []string
 }
 
 // Load reads configuration from the environment and a local .env file.
@@ -83,6 +86,11 @@ func Load() (*Config, error) {
 	}
 	home = absoluteHome
 
+	writableRoots, err := resolveWritableRoots(os.Getenv("EBIII_WRITABLE_ROOTS"))
+	if err != nil {
+		return nil, fmt.Errorf("EBIII_WRITABLE_ROOTS: %w", err)
+	}
+
 	return &Config{
 		SlackBotToken:     botToken,
 		SlackAppToken:     appToken,
@@ -96,7 +104,65 @@ func Load() (*Config, error) {
 		MemoryDir:         filepath.Join(home, "memory"),
 		PlaybooksDir:      filepath.Join(home, "playbooks"),
 		StateDir:          filepath.Join(home, "state"),
+		WritableRoots:     writableRoots,
 	}, nil
+}
+
+// resolveWritableRoots parses a comma-separated list of directories into
+// absolute, symlink-resolved paths with duplicates removed.
+//
+// Every entry must already exist and be a directory. A writable root widens
+// the agent's sandbox, so a typo is rejected at startup rather than silently
+// granting nothing.
+func resolveWritableRoots(value string) ([]string, error) {
+	var roots []string
+	seen := make(map[string]struct{})
+	for _, item := range splitList(value) {
+		expanded, err := expandHome(item)
+		if err != nil {
+			return nil, fmt.Errorf("%q: %w", item, err)
+		}
+		absolute, err := filepath.Abs(expanded)
+		if err != nil {
+			return nil, fmt.Errorf("%q: %w", item, err)
+		}
+		resolved, err := filepath.EvalSymlinks(absolute)
+		if err != nil {
+			return nil, fmt.Errorf("%q: %w", item, err)
+		}
+		info, err := os.Stat(resolved)
+		if err != nil {
+			return nil, fmt.Errorf("%q: %w", item, err)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("%q: %w", item, errors.New("must be a directory"))
+		}
+		if _, exists := seen[resolved]; exists {
+			continue
+		}
+		seen[resolved] = struct{}{}
+		roots = append(roots, resolved)
+	}
+	return roots, nil
+}
+
+// expandHome replaces a leading ~ or ~/ with the current user's home
+// directory. The ~user form is not supported.
+func expandHome(path string) (string, error) {
+	if path != "~" && !strings.HasPrefix(path, "~"+string(filepath.Separator)) {
+		if strings.HasPrefix(path, "~") {
+			return "", errors.New("~user expansion is not supported")
+		}
+		return path, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("expand ~: %w", err)
+	}
+	if path == "~" {
+		return home, nil
+	}
+	return filepath.Join(home, path[2:]), nil
 }
 
 func requiredEnv(name string) (string, error) {

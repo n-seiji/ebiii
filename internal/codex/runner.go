@@ -112,13 +112,8 @@ func buildArgs(threadID, sandbox, cwd string, writableRoots []string, model, dev
 	}
 	if sandbox == "workspace-write" {
 		args = append(args, "-c", "sandbox_workspace_write.network_access=true")
-		if len(writableRoots) > 0 {
-			quoted := make([]string, len(writableRoots))
-			for i, root := range writableRoots {
-				quoted[i] = strconv.Quote(root)
-			}
-			args = append(args, "-c",
-				"sandbox_workspace_write.writable_roots=["+strings.Join(quoted, ",")+"]")
+		for _, root := range writableRoots {
+			args = append(args, "--add-dir", root)
 		}
 	}
 	if model != "" {
