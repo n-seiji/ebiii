@@ -1,7 +1,8 @@
 .env
-/state/
 /ebiii
 *.exe
 *.test
 *.out
-playbooks/
+
+# Runtime data (workspace, memory, playbooks, state)
+/data/

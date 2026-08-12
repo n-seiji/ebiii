@@ -100,10 +100,10 @@ func Load() (*Config, error) {
 		CodexModel:        strings.TrimSpace(os.Getenv("CODEX_MODEL")),
 		CodexTimeout:      codexTimeout,
 		EBIIIHome:         home,
-		WorkspaceDir:      filepath.Join(home, "workspace"),
-		MemoryDir:         filepath.Join(home, "memory"),
-		PlaybooksDir:      filepath.Join(home, "playbooks"),
-		StateDir:          filepath.Join(home, "state"),
+		WorkspaceDir:      filepath.Join(home, "data", "workspace"),
+		MemoryDir:         filepath.Join(home, "data", "memory"),
+		PlaybooksDir:      filepath.Join(home, "data", "playbooks"),
+		StateDir:          filepath.Join(home, "data", "state"),
 		WritableRoots:     writableRoots,
 	}, nil
 }

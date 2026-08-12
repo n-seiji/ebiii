@@ -295,8 +295,7 @@ func assertPaths(t *testing.T, cfg *Config, home string) {
 		"StateDir":     cfg.StateDir,
 	}
 	for name, got := range paths {
-		want := filepath.Join(home, strings.TrimSuffix(name, "Dir"))
-		want = filepath.Join(home, strings.ToLower(filepath.Base(want)))
+		want := filepath.Join(home, "data", strings.ToLower(strings.TrimSuffix(name, "Dir")))
 		if got != want {
 			t.Errorf("%s = %q, want %q", name, got, want)
 		}
