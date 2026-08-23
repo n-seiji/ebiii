@@ -287,6 +287,42 @@ func TestPlanWorkDone(t *testing.T) {
 	assertFinalReactionOrder(t, api.calls, "white_check_mark")
 }
 
+func TestKeepStatusRetriesThenRefreshes(t *testing.T) {
+	api := &fakeSlack{}
+	bot := newTestBot(t, &fakeStore{}, api, &fakeRunner{})
+	sleepCalls := make(chan time.Duration)
+	releaseSleep := make(chan struct{})
+	bot.sleep = func(ctx context.Context, duration time.Duration) error {
+		select {
+		case sleepCalls <- duration:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		select {
+		case <-releaseSleep:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	stop := bot.keepStatus(context.Background(), "C1", "100.1", workingStatus)
+	if got := receiveDuration(t, sleepCalls); got != statusRetryDelay {
+		t.Fatalf("first status delay = %v, want %v", got, statusRetryDelay)
+	}
+	releaseSleep <- struct{}{}
+	if got := receiveDuration(t, sleepCalls); got != statusRefreshDelay {
+		t.Fatalf("second status delay = %v, want %v", got, statusRefreshDelay)
+	}
+	releaseSleep <- struct{}{}
+	if got := receiveDuration(t, sleepCalls); got != statusRefreshDelay {
+		t.Fatalf("third status delay = %v, want %v", got, statusRefreshDelay)
+	}
+	stop()
+
+	assertStatusSequence(t, api.calls, []string{workingStatus, workingStatus, workingStatus})
+}
+
 func TestWorkTurnReceivesWritableRootsAndPlanTurnDoesNot(t *testing.T) {
 	store := &fakeStore{claim: true}
 	api := &fakeSlack{}
@@ -596,5 +632,16 @@ func assertStatusSequence(t *testing.T, calls []slackCall, want []string) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("status sequence = %q, want %q", got, want)
+	}
+}
+
+func receiveDuration(t *testing.T, calls <-chan time.Duration) time.Duration {
+	t.Helper()
+	select {
+	case duration := <-calls:
+		return duration
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for status refresh")
+		return 0
 	}
 }

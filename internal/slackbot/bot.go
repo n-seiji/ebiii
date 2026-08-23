@@ -28,6 +28,8 @@ const (
 	workFailureMessage   = "⚠️ 作業が完了したことを確認できませんでした。状況を確認し、新しい mention で依頼し直してください。"
 	planningStatus       = "が方針を考えています…"
 	workingStatus        = "が作業を進めています…"
+	statusRetryDelay     = time.Second
+	statusRefreshDelay   = 80 * time.Second
 )
 
 // SlackAPI is the subset of Slack Web API used by Bot.
@@ -212,9 +214,11 @@ func (b *Bot) HandleMention(ctx context.Context, event *slackevents.AppMentionEv
 		b.fail(ctx, eventKey, state.PlanPosted, state.Failed, event.Channel, threadTS, event.TimeStamp, planFailureMessage)
 		return
 	}
-	// Posting the plan clears Slack's status automatically, so set a new one
-	// before the potentially long-running work turn.
-	b.setStatus(ctx, event.Channel, threadTS, workingStatus)
+	// Posting the plan clears Slack's status automatically. Keep reapplying the
+	// work status so a delayed auto-clear cannot erase it and Slack's two-minute
+	// status timeout cannot expire during a long-running work turn.
+	stopWorkingStatus := b.keepStatus(ctx, event.Channel, threadTS, workingStatus)
+	defer stopWorkingStatus()
 
 	// workMu serializes work turns and the memory append that follows them.
 	// memoryMu is only held around the memory access itself, so a plan turn can
@@ -322,6 +326,35 @@ func (b *Bot) addReaction(ctx context.Context, channel, timestamp, name string) 
 func (b *Bot) setStatus(ctx context.Context, channel, threadTS, status string) {
 	if err := b.api.SetStatus(ctx, channel, threadTS, status); err != nil {
 		log.Printf("slackbot: set thread status %q: %v", status, err)
+	}
+}
+
+func (b *Bot) keepStatus(ctx context.Context, channel, threadTS, status string) func() {
+	statusCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	b.setStatus(ctx, channel, threadTS, status)
+	go func() {
+		defer close(done)
+		// Slack clears the previous status when it processes the plan reply.
+		// Reapply once shortly afterward to recover from that asynchronous clear.
+		if err := b.sleep(statusCtx, statusRetryDelay); err != nil {
+			return
+		}
+		b.setStatus(statusCtx, channel, threadTS, status)
+		for {
+			if err := b.sleep(statusCtx, statusRefreshDelay); err != nil {
+				return
+			}
+			b.setStatus(statusCtx, channel, threadTS, status)
+		}
+	}()
+
+	var stopOnce sync.Once
+	return func() {
+		stopOnce.Do(func() {
+			cancel()
+			<-done
+		})
 	}
 }
 
