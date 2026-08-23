@@ -26,11 +26,14 @@ const (
 	failClosedMessage    = "作業指示を確定できなかったため、作業は開始していません。指示を明確にして、もう一度 mention してください。"
 	planFailureMessage   = "⚠️ 方針の検討または投稿に失敗しました。もう一度 mention してください。"
 	workFailureMessage   = "⚠️ 作業が完了したことを確認できませんでした。状況を確認し、新しい mention で依頼し直してください。"
+	planningStatus       = "が方針を考えています…"
+	workingStatus        = "が作業を進めています…"
 )
 
 // SlackAPI is the subset of Slack Web API used by Bot.
 type SlackAPI interface {
 	PostMessage(ctx context.Context, channel, threadTS, text string) (string, error)
+	SetStatus(ctx context.Context, channel, threadTS, status string) error
 	AddReaction(ctx context.Context, channel, timestamp, name string) error
 	RemoveReaction(ctx context.Context, channel, timestamp, name string) error
 }
@@ -143,6 +146,8 @@ func (b *Bot) HandleMention(ctx context.Context, event *slackevents.AppMentionEv
 		b.finalReaction(ctx, event.Channel, event.TimeStamp, false)
 		return
 	}
+	b.setStatus(ctx, event.Channel, threadTS, planningStatus)
+	defer b.clearStatus(ctx, event.Channel, threadTS)
 
 	lock := b.threadLock(threadKey)
 	lock.Lock()
@@ -207,6 +212,9 @@ func (b *Bot) HandleMention(ctx context.Context, event *slackevents.AppMentionEv
 		b.fail(ctx, eventKey, state.PlanPosted, state.Failed, event.Channel, threadTS, event.TimeStamp, planFailureMessage)
 		return
 	}
+	// Posting the plan clears Slack's status automatically, so set a new one
+	// before the potentially long-running work turn.
+	b.setStatus(ctx, event.Channel, threadTS, workingStatus)
 
 	// workMu serializes work turns and the memory append that follows them.
 	// memoryMu is only held around the memory access itself, so a plan turn can
@@ -311,6 +319,19 @@ func (b *Bot) addReaction(ctx context.Context, channel, timestamp, name string) 
 	}
 }
 
+func (b *Bot) setStatus(ctx context.Context, channel, threadTS, status string) {
+	if err := b.api.SetStatus(ctx, channel, threadTS, status); err != nil {
+		log.Printf("slackbot: set thread status %q: %v", status, err)
+	}
+}
+
+func (b *Bot) clearStatus(ctx context.Context, channel, threadTS string) {
+	// Shutdown cancellation should not leave a stale loading indicator behind.
+	clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	b.setStatus(clearCtx, channel, threadTS, "")
+}
+
 func (b *Bot) post(ctx context.Context, channel, threadTS, text string) error {
 	for _, chunk := range splitMessage(text, maxSlackMessageRunes) {
 		if _, err := b.api.PostMessage(ctx, channel, threadTS, chunk); err != nil {
@@ -396,6 +417,14 @@ type webAPI struct {
 func (w *webAPI) PostMessage(ctx context.Context, channel, threadTS, text string) (string, error) {
 	_, timestamp, err := w.client.PostMessageContext(ctx, channel, slack.MsgOptionText(text, false), slack.MsgOptionTS(threadTS))
 	return timestamp, err
+}
+
+func (w *webAPI) SetStatus(ctx context.Context, channel, threadTS, status string) error {
+	return w.client.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
+		ChannelID: channel,
+		ThreadTS:  threadTS,
+		Status:    status,
+	})
 }
 
 func (w *webAPI) AddReaction(ctx context.Context, channel, timestamp, name string) error {

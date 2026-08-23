@@ -86,6 +86,13 @@ func (s *fakeSlack) PostMessage(_ context.Context, _, _, text string) (string, e
 	return "reply-ts", err
 }
 
+func (s *fakeSlack) SetStatus(_ context.Context, _, _, status string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, slackCall{kind: "status", text: status})
+	return nil
+}
+
 func (s *fakeSlack) AddReaction(_ context.Context, _, _, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -246,6 +253,7 @@ func TestNoneTransitionsToDoneWithCheckmark(t *testing.T) {
 		{state.Planning, state.PlanPosted},
 		{state.PlanPosted, state.Done},
 	})
+	assertStatusSequence(t, api.calls, []string{planningStatus, ""})
 	assertFinalReactionOrder(t, api.calls, "white_check_mark")
 }
 
@@ -275,6 +283,7 @@ func TestPlanWorkDone(t *testing.T) {
 	if runner.roots[0] != nil || runner.roots[1] != nil {
 		t.Fatalf("writable roots = %v, want no writable roots for either turn", runner.roots)
 	}
+	assertStatusSequence(t, api.calls, []string{planningStatus, workingStatus, ""})
 	assertFinalReactionOrder(t, api.calls, "white_check_mark")
 }
 
@@ -574,5 +583,18 @@ func assertFinalReactionOrder(t *testing.T, calls []slackCall, final string) {
 	}
 	if addIndex < 0 || removeIndex < 0 || addIndex >= removeIndex {
 		t.Fatalf("reaction calls = %v, want add:%s before remove:eyes", calls, final)
+	}
+}
+
+func assertStatusSequence(t *testing.T, calls []slackCall, want []string) {
+	t.Helper()
+	var got []string
+	for _, call := range calls {
+		if call.kind == "status" {
+			got = append(got, call.text)
+		}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("status sequence = %q, want %q", got, want)
 	}
 }
