@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sync"
@@ -304,8 +305,6 @@ func terminal(state State) bool {
 
 func cloneEvents(source map[string]event) map[string]event {
 	cloned := make(map[string]event, len(source))
-	for key, entry := range source {
-		cloned[key] = entry
-	}
+	maps.Copy(cloned, source)
 	return cloned
 }

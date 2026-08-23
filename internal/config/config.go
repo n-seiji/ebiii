@@ -175,7 +175,7 @@ func requiredEnv(name string) (string, error) {
 
 func splitList(value string) []string {
 	var result []string
-	for _, item := range strings.Split(value, ",") {
+	for item := range strings.SplitSeq(value, ",") {
 		item = strings.TrimSpace(item)
 		if item != "" {
 			result = append(result, item)

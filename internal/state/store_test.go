@@ -20,9 +20,7 @@ func TestClaimEventConcurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, goroutines)
 	for range goroutines {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			claimed, err := store.ClaimEvent("C123:100.001")
 			if err != nil {
@@ -32,7 +30,7 @@ func TestClaimEventConcurrent(t *testing.T) {
 			if claimed {
 				claimedCount.Add(1)
 			}
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()

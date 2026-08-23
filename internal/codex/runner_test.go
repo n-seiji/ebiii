@@ -254,6 +254,45 @@ func TestTruncateFinalMessage(t *testing.T) {
 	}
 }
 
+func TestRunReturnsCompletedTurn(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "codex")
+	content := `#!/bin/sh
+prompt=$(cat)
+test "$prompt" = "hello from stdin" || exit 2
+printf '{"type":"thread.started","thread_id":"thread-1"}\n'
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"completed response"}}\n'
+printf '{"type":"turn.completed"}\n'
+`
+	if err := os.WriteFile(script, []byte(content), 0o755); err != nil {
+		t.Fatalf("write fake codex: %v", err)
+	}
+
+	var callbackIDs []string
+	runner := &Runner{Command: script}
+	result, err := runner.Run(
+		context.Background(), "", "read-only", dir, nil, "hello from stdin",
+		func(id string) error {
+			callbackIDs = append(callbackIDs, id)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	want := &TurnResult{
+		ThreadID:  "thread-1",
+		Messages:  []string{"completed response"},
+		Completed: true,
+	}
+	if !reflect.DeepEqual(result, want) {
+		t.Errorf("Run() result = %#v, want %#v", result, want)
+	}
+	if !reflect.DeepEqual(callbackIDs, []string{"thread-1"}) {
+		t.Errorf("thread callbacks = %#v, want [thread-1]", callbackIDs)
+	}
+}
+
 func TestRunThreadStartedCallbackErrorCancelsProcess(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "codex")

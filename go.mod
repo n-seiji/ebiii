@@ -1,6 +1,6 @@
 module github.com/n-seiji/ebiii
 
-go 1.26
+go 1.27
 
 require github.com/slack-go/slack v0.17.3
 

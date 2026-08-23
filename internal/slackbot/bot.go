@@ -317,8 +317,7 @@ func (b *Bot) post(ctx context.Context, channel, threadTS, text string) error {
 			if !retryable(err) {
 				return fmt.Errorf("post Slack message: %w", err)
 			}
-			var rateLimited *slack.RateLimitedError
-			if errors.As(err, &rateLimited) {
+			if rateLimited, ok := errors.AsType[*slack.RateLimitedError](err); ok {
 				if err := b.sleep(ctx, rateLimited.RetryAfter); err != nil {
 					return fmt.Errorf("wait for Slack retry: %w", err)
 				}
@@ -349,10 +348,7 @@ func splitMessage(text string, limit int) []string {
 	}
 	chunks := make([]string, 0, (len(runes)+limit-1)/limit)
 	for len(runes) > 0 {
-		n := limit
-		if len(runes) < n {
-			n = len(runes)
-		}
+		n := min(len(runes), limit)
 		chunks = append(chunks, string(runes[:n]))
 		runes = runes[n:]
 	}
@@ -360,8 +356,7 @@ func splitMessage(text string, limit int) []string {
 }
 
 func retryable(err error) bool {
-	var rateLimited *slack.RateLimitedError
-	if errors.As(err, &rateLimited) {
+	if _, ok := errors.AsType[*slack.RateLimitedError](err); ok {
 		return true
 	}
 	var status interface{ HTTPStatusCode() int }
@@ -454,11 +449,9 @@ func RunSocketMode(acceptCtx, turnCtx context.Context, botToken, appToken string
 			if !ok {
 				continue
 			}
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				bot.HandleMention(turnCtx, mention)
-			}()
+			})
 		}
 	}
 }
