@@ -90,6 +90,11 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("EBIII_WRITABLE_ROOTS: %w", err)
 	}
+	workspaceDir := filepath.Join(home, "data", "workspace")
+	memoryDir := filepath.Join(home, "data", "memory")
+	if err := validateMemoryIsolation(workspaceDir, memoryDir, writableRoots); err != nil {
+		return nil, err
+	}
 
 	return &Config{
 		SlackBotToken:     botToken,
@@ -100,12 +105,77 @@ func Load() (*Config, error) {
 		CodexModel:        strings.TrimSpace(os.Getenv("CODEX_MODEL")),
 		CodexTimeout:      codexTimeout,
 		EBIIIHome:         home,
-		WorkspaceDir:      filepath.Join(home, "data", "workspace"),
-		MemoryDir:         filepath.Join(home, "data", "memory"),
+		WorkspaceDir:      workspaceDir,
+		MemoryDir:         memoryDir,
 		PlaybooksDir:      filepath.Join(home, "data", "playbooks"),
 		StateDir:          filepath.Join(home, "data", "state"),
 		WritableRoots:     writableRoots,
 	}, nil
+}
+
+// validateMemoryIsolation keeps the agent's workspace and every additional
+// sandbox root disjoint from memory. Codex receives only the current scoped
+// memory through its prompt; it must never be able to inspect the backing
+// files directly.
+func validateMemoryIsolation(workspaceDir, memoryDir string, writableRoots []string) error {
+	workspace, err := canonicalPath(workspaceDir)
+	if err != nil {
+		return fmt.Errorf("resolve workspace directory: %w", err)
+	}
+	memory, err := canonicalPath(memoryDir)
+	if err != nil {
+		return fmt.Errorf("resolve memory directory: %w", err)
+	}
+	if pathsOverlap(workspace, memory) {
+		return errors.New("workspace overlaps protected memory directory")
+	}
+	for _, root := range writableRoots {
+		if pathsOverlap(root, memory) {
+			return fmt.Errorf("EBIII_WRITABLE_ROOTS: %q overlaps protected memory directory", root)
+		}
+	}
+	return nil
+}
+
+// canonicalPath resolves symlinks in the existing prefix while still
+// supporting paths whose final components have not been created yet.
+func canonicalPath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	current := filepath.Clean(absolute)
+	var missing []string
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", err
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
+}
+
+func pathsOverlap(a, b string) bool {
+	return pathContains(a, b) || pathContains(b, a)
+}
+
+func pathContains(parent, child string) bool {
+	relative, err := filepath.Rel(parent, child)
+	if err != nil {
+		return false
+	}
+	return relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
 // resolveWritableRoots parses a comma-separated list of directories into

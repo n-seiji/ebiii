@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/n-seiji/ebiii/internal/codex"
+	"github.com/n-seiji/ebiii/internal/memory"
 	"github.com/n-seiji/ebiii/internal/state"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
@@ -24,7 +25,8 @@ type fakeStore struct {
 	claimCalls  int
 	current     state.State
 	transitions [][2]state.State
-	threadID    string
+	threadIDs   map[string]string
+	threadKeys  []string
 }
 
 func (s *fakeStore) ClaimEvent(string) (bool, error) {
@@ -48,16 +50,21 @@ func (s *fakeStore) Transition(_ string, from, to state.State) error {
 	return nil
 }
 
-func (s *fakeStore) GetThread(string) (string, bool) {
+func (s *fakeStore) GetThread(key string) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.threadID, s.threadID != ""
+	s.threadKeys = append(s.threadKeys, key)
+	threadID, ok := s.threadIDs[key]
+	return threadID, ok
 }
 
-func (s *fakeStore) SetThread(_, threadID string) error {
+func (s *fakeStore) SetThread(key, threadID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.threadID = threadID
+	if s.threadIDs == nil {
+		s.threadIDs = make(map[string]string)
+	}
+	s.threadIDs[key] = threadID
 	return nil
 }
 
@@ -67,10 +74,14 @@ type slackCall struct {
 }
 
 type fakeSlack struct {
-	mu        sync.Mutex
-	calls     []slackCall
-	postErrs  []error
-	postTexts []string
+	mu             sync.Mutex
+	calls          []slackCall
+	postErrs       []error
+	postTexts      []string
+	threadMessages []ThreadMessage
+	threadErr      error
+	threadCalls    int
+	threadLatest   string
 }
 
 func (s *fakeSlack) PostMessage(_ context.Context, _, _, text string) (string, error) {
@@ -84,6 +95,14 @@ func (s *fakeSlack) PostMessage(_ context.Context, _, _, text string) (string, e
 		s.postErrs = s.postErrs[1:]
 	}
 	return "reply-ts", err
+}
+
+func (s *fakeSlack) GetThreadMessages(_ context.Context, _, _, latest string) ([]ThreadMessage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.threadCalls++
+	s.threadLatest = latest
+	return append([]ThreadMessage(nil), s.threadMessages...), s.threadErr
 }
 
 func (s *fakeSlack) SetStatus(_ context.Context, _, _, status string) error {
@@ -116,14 +135,20 @@ type fakeRunner struct {
 	mu        sync.Mutex
 	responses []runnerResponse
 	calls     int
+	threadIDs []string
+	sandboxes []string
+	cwds      []string
 	roots     [][]string
 	prompts   []string
 }
 
-func (r *fakeRunner) Run(_ context.Context, _ string, _ string, _ string, roots []string, prompt string, callback func(string) error) (*codex.TurnResult, error) {
+func (r *fakeRunner) Run(_ context.Context, threadID, sandbox, cwd string, roots []string, prompt string, callback func(string) error) (*codex.TurnResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls++
+	r.threadIDs = append(r.threadIDs, threadID)
+	r.sandboxes = append(r.sandboxes, sandbox)
+	r.cwds = append(r.cwds, cwd)
 	r.roots = append(r.roots, roots)
 	r.prompts = append(r.prompts, prompt)
 	if callback != nil {
@@ -140,7 +165,6 @@ func newTestBot(t *testing.T, store *fakeStore, api *fakeSlack, runner *fakeRunn
 	t.Helper()
 	return New(api, store, runner, Config{
 		AllowedUserIDs: []string{"U1"},
-		EBIIIHome:      "/repo",
 		WorkspaceDir:   "/repo/workspace",
 		MemoryDir:      filepath.Join(t.TempDir(), "memory"),
 		CodexTimeout:   time.Minute,
@@ -287,6 +311,126 @@ func TestPlanWorkDone(t *testing.T) {
 	assertFinalReactionOrder(t, api.calls, "white_check_mark")
 }
 
+func TestPlanSessionsAreSeparatedByUser(t *testing.T) {
+	store := &fakeStore{claim: true}
+	runner := &fakeRunner{responses: []runnerResponse{
+		{result: &codex.TurnResult{Completed: true, Messages: []string{"## 方針\nDone.\n## 作業指示\nNONE"}}},
+		{result: &codex.TurnResult{Completed: true, Messages: []string{"## 方針\nDone.\n## 作業指示\nNONE"}}},
+	}}
+	bot := newTestBot(t, store, &fakeSlack{}, runner)
+	bot.allowedUsers["U2"] = struct{}{}
+	bot.HandleMention(context.Background(), mention())
+	bot.HandleMention(context.Background(), &slackevents.AppMentionEvent{
+		User: "U2", Channel: "C1", TimeStamp: "200.2", ThreadTimeStamp: "100.1", Text: "<@UBOT> do it",
+	})
+
+	want := []string{"v2:C1:100.1:U1", "v2:C1:100.1:U2"}
+	if !reflect.DeepEqual(store.threadKeys, want) {
+		t.Fatalf("thread keys = %v, want %v", store.threadKeys, want)
+	}
+	if len(store.threadIDs) != 2 {
+		t.Fatalf("stored thread keys = %v, want two user-specific sessions", store.threadIDs)
+	}
+}
+
+func TestFirstThreadMentionReceivesEarlierSlackMessages(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{threadMessages: []ThreadMessage{
+		{AuthorID: "U2", Timestamp: "100.1", Text: "root context"},
+		{AuthorID: "U3", Timestamp: "200.2", Text: "important detail"},
+		{AuthorID: "U1", Timestamp: "300.3", Text: "<@UBOT> current request"},
+	}}
+	runner := &fakeRunner{responses: []runnerResponse{{result: &codex.TurnResult{
+		Completed: true,
+		Messages:  []string{"## 方針\nDone.\n## 作業指示\nNONE"},
+	}}}}
+	event := mention()
+	event.TimeStamp = "300.3"
+	event.ThreadTimeStamp = "100.1"
+	event.Text = "<@UBOT> current request"
+
+	newTestBot(t, store, api, runner).HandleMention(context.Background(), event)
+
+	if api.threadCalls != 1 || api.threadLatest != "300.3" {
+		t.Fatalf("thread fetch calls = %d, latest = %q, want one call through current mention", api.threadCalls, api.threadLatest)
+	}
+	if len(runner.prompts) != 1 {
+		t.Fatalf("runner prompts = %d, want 1", len(runner.prompts))
+	}
+	got := runner.prompts[0]
+	for _, want := range []string{"<slack_thread>", "root context", "important detail", "<user_message>\ncurrent request"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan prompt does not contain %q", want)
+		}
+	}
+	if strings.Count(got, "<@UBOT> current request") != 0 {
+		t.Error("current mention was duplicated into Slack thread context")
+	}
+}
+
+func TestExistingPlanSessionSkipsSlackThreadFetch(t *testing.T) {
+	store := &fakeStore{
+		claim:     true,
+		threadIDs: map[string]string{"v2:C1:100.1:U1": "existing-thread"},
+	}
+	api := &fakeSlack{threadErr: errors.New("must not be called")}
+	runner := &fakeRunner{responses: []runnerResponse{{result: &codex.TurnResult{
+		Completed: true,
+		Messages:  []string{"## 方針\nDone.\n## 作業指示\nNONE"},
+	}}}}
+	event := mention()
+	event.TimeStamp = "200.2"
+	event.ThreadTimeStamp = "100.1"
+
+	newTestBot(t, store, api, runner).HandleMention(context.Background(), event)
+
+	if api.threadCalls != 0 {
+		t.Fatalf("thread fetch calls = %d, want 0", api.threadCalls)
+	}
+	if len(runner.threadIDs) != 1 || runner.threadIDs[0] != "existing-thread" {
+		t.Fatalf("runner thread IDs = %v, want existing session", runner.threadIDs)
+	}
+	if strings.Contains(runner.prompts[0], "<slack_thread>") {
+		t.Error("existing session prompt unexpectedly contains Slack thread context")
+	}
+}
+
+func TestThreadFetchFailureDoesNotStartCodex(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{threadErr: errors.New("Slack unavailable")}
+	runner := &fakeRunner{}
+	event := mention()
+	event.TimeStamp = "200.2"
+	event.ThreadTimeStamp = "100.1"
+
+	newTestBot(t, store, api, runner).HandleMention(context.Background(), event)
+
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if store.current != state.Failed {
+		t.Fatalf("state = %q, want failed", store.current)
+	}
+	if !strings.Contains(strings.Join(api.postTexts, "|"), threadFailureMessage) {
+		t.Fatalf("posts = %q, want thread failure message", api.postTexts)
+	}
+	assertFinalReactionOrder(t, api.calls, "x")
+}
+
+func TestFormatThreadContextCapsRunesAndKeepsEnds(t *testing.T) {
+	got := formatThreadContext([]ThreadMessage{{
+		AuthorID: "U1", Timestamp: "100.1", Text: strings.Repeat("前", maxThreadContextRunes) + "末尾",
+	}}, "200.2")
+	if len([]rune(got)) != maxThreadContextRunes {
+		t.Fatalf("context runes = %d, want %d", len([]rune(got)), maxThreadContextRunes)
+	}
+	for _, want := range []string{"[100.1 / U1]", "中間を省略", "末尾"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("thread context does not contain %q", want)
+		}
+	}
+}
+
 func TestKeepStatusRetriesThenRefreshes(t *testing.T) {
 	api := &fakeSlack{}
 	bot := newTestBot(t, &fakeStore{}, api, &fakeRunner{})
@@ -336,7 +480,6 @@ func TestWorkTurnReceivesWritableRootsAndPlanTurnDoesNot(t *testing.T) {
 	roots := []string{"/extra/one", "/extra/two"}
 	bot := New(api, store, runner, Config{
 		AllowedUserIDs: []string{"U1"},
-		EBIIIHome:      "/repo",
 		WorkspaceDir:   "/repo/workspace",
 		MemoryDir:      filepath.Join(t.TempDir(), "memory"),
 		CodexTimeout:   time.Minute,
@@ -353,9 +496,18 @@ func TestWorkTurnReceivesWritableRootsAndPlanTurnDoesNot(t *testing.T) {
 	if runner.roots[0] != nil {
 		t.Errorf("plan turn writable roots = %v, want nil", runner.roots[0])
 	}
+	if got := runner.cwds[0]; got != "/repo/workspace" {
+		t.Errorf("plan turn cwd = %q, want isolated workspace", got)
+	}
+	if got := runner.sandboxes[0]; got != "read-only" {
+		t.Errorf("plan turn sandbox = %q, want read-only", got)
+	}
 	want := []string{"/extra/one", "/extra/two"}
 	if !reflect.DeepEqual(runner.roots[1], want) {
 		t.Errorf("work turn writable roots = %v, want %v", runner.roots[1], want)
+	}
+	if got := runner.cwds[1]; got != "/repo/workspace" {
+		t.Errorf("work turn cwd = %q, want isolated workspace", got)
 	}
 }
 
@@ -367,18 +519,29 @@ func TestPlanPromptInjectsMemoryContent(t *testing.T) {
 		Messages:  []string{"## 方針\nNo work needed.\n## 作業指示\nNONE"},
 	}}}}
 	bot := newTestBot(t, store, api, runner)
-	if err := os.MkdirAll(bot.config.MemoryDir, 0o755); err != nil {
-		t.Fatalf("mkdir memory: %v", err)
+	entries := []struct {
+		scope memory.Scope
+		text  string
+	}{
+		{scope: memory.ScopeGlobal, text: "全体の学び"},
+		{scope: memory.ScopeUser, text: "ユーザーの好み"},
+		{scope: memory.ScopeChannel, text: "チャンネルの慣習"},
 	}
-	if err := os.WriteFile(filepath.Join(bot.config.MemoryDir, "MEMORY.md"), []byte("# Memory\n重要な学び"), 0o644); err != nil {
-		t.Fatalf("write memory: %v", err)
+	for _, entry := range entries {
+		if _, err := memory.AppendScoped(bot.config.MemoryDir, entry.scope, "U1", "C1", entry.text); err != nil {
+			t.Fatalf("append %s memory: %v", entry.scope, err)
+		}
 	}
 	bot.HandleMention(context.Background(), mention())
 	if len(runner.prompts) != 1 {
 		t.Fatalf("runner prompts = %d, want 1", len(runner.prompts))
 	}
 	prompt := runner.prompts[0]
-	for _, want := range []string{"<memory>", "重要な学び", "</memory>"} {
+	for _, want := range []string{
+		"<global_memory>", "全体の学び", "</global_memory>",
+		"<user_memory>", "ユーザーの好み", "</user_memory>",
+		"<channel_memory>", "チャンネルの慣習", "</channel_memory>",
+	} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("plan prompt does not contain %q", want)
 		}
@@ -398,7 +561,12 @@ func TestWorkMemoryAppendIsWrittenByBot(t *testing.T) {
 		}},
 		{result: &codex.TurnResult{
 			Completed: true,
-			Messages:  []string{"Work completed.\n## メモリ追記\nビルドは mise run build を使う"},
+			Messages: []string{strings.Join([]string{
+				"Work completed.",
+				"## 全体メモリ追記", "ビルドは mise run build を使う",
+				"## ユーザーメモリ追記", "簡潔な日本語を好む",
+				"## チャンネルメモリ追記", "動作確認用チャンネル",
+			}, "\n")},
 		}},
 	}}
 	bot := newTestBot(t, store, api, runner)
@@ -406,19 +574,58 @@ func TestWorkMemoryAppendIsWrittenByBot(t *testing.T) {
 	if store.current != state.Done {
 		t.Fatalf("state = %q, want done", store.current)
 	}
-	data, err := os.ReadFile(filepath.Join(bot.config.MemoryDir, "MEMORY.md"))
-	if err != nil {
-		t.Fatalf("read memory: %v", err)
+	files := []struct {
+		path string
+		want string
+	}{
+		{path: filepath.Join(bot.config.MemoryDir, "MEMORY.md"), want: "ビルドは mise run build を使う"},
+		{path: filepath.Join(bot.config.MemoryDir, "users", "U1", "MEMORY.md"), want: "簡潔な日本語を好む"},
+		{path: filepath.Join(bot.config.MemoryDir, "channels", "C1", "MEMORY.md"), want: "動作確認用チャンネル"},
 	}
-	if !strings.Contains(string(data), "ビルドは mise run build を使う") {
-		t.Fatalf("memory file = %q, want appended entry", data)
+	for _, file := range files {
+		data, err := os.ReadFile(file.path)
+		if err != nil {
+			t.Fatalf("read memory %s: %v", file.path, err)
+		}
+		if !strings.Contains(string(data), file.want) {
+			t.Fatalf("memory file %s = %q, want %q", file.path, data, file.want)
+		}
 	}
 	posts := strings.Join(api.postTexts, "|")
-	if !strings.Contains(posts, "Work completed.") || !strings.Contains(posts, "メモリに追記しました") {
+	if !strings.Contains(posts, "Work completed.") || !strings.Contains(posts, "全体・ユーザー・チャンネルメモリを更新しました") {
 		t.Fatalf("posts = %q, want work result and memory notification", posts)
 	}
-	if strings.Contains(posts, "## メモリ追記") {
-		t.Fatalf("posts = %q, memory heading should be stripped", posts)
+	for _, private := range []string{"ビルドは mise run build を使う", "簡潔な日本語を好む", "動作確認用チャンネル", "## ユーザーメモリ追記"} {
+		if strings.Contains(posts, private) {
+			t.Fatalf("posts = %q, should not expose memory content %q", posts, private)
+		}
+	}
+}
+
+func TestMalformedMemoryOutputIsNotPostedOrWritten(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{}
+	runner := &fakeRunner{responses: []runnerResponse{
+		{result: &codex.TurnResult{
+			Completed: true,
+			Messages:  []string{"## 方針\nDo work.\n## 作業指示\nMake a change."},
+		}},
+		{result: &codex.TurnResult{
+			Completed: true,
+			Messages: []string{
+				"Work completed.\n## ユーザーメモリ追記\nprivate one\n## ユーザーメモリ追記\nprivate two",
+			},
+		}},
+	}}
+	bot := newTestBot(t, store, api, runner)
+	bot.HandleMention(context.Background(), mention())
+
+	posts := strings.Join(api.postTexts, "|")
+	if !strings.Contains(posts, "Work completed.") || strings.Contains(posts, "private") {
+		t.Fatalf("posts = %q, malformed private memory must be stripped", posts)
+	}
+	if _, err := os.Stat(filepath.Join(bot.config.MemoryDir, "users", "U1", "MEMORY.md")); !os.IsNotExist(err) {
+		t.Fatalf("malformed memory should not be written, stat error = %v", err)
 	}
 }
 
@@ -508,7 +715,6 @@ func TestPlanTurnRunsWhileWorkTurnIsBlocked(t *testing.T) {
 	}
 	bot := New(&fakeSlack{}, &looseStore{threads: map[string]string{}}, runner, Config{
 		AllowedUserIDs: []string{"U1"},
-		EBIIIHome:      "/repo",
 		WorkspaceDir:   "/repo/workspace",
 		MemoryDir:      filepath.Join(t.TempDir(), "memory"),
 		CodexTimeout:   time.Minute,

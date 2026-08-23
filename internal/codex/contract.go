@@ -6,10 +6,21 @@ import (
 )
 
 const (
-	policyHeading      = "## 方針"
-	instructionHeading = "## 作業指示"
-	memoryHeading      = "## メモリ追記"
+	policyHeading        = "## 方針"
+	instructionHeading   = "## 作業指示"
+	memoryHeading        = "## メモリ追記"
+	globalMemoryHeading  = "## 全体メモリ追記"
+	userMemoryHeading    = "## ユーザーメモリ追記"
+	channelMemoryHeading = "## チャンネルメモリ追記"
 )
+
+// MemoryAppends contains optional entries proposed by a work turn. The bot
+// chooses the actual user and channel paths from the authenticated Slack event.
+type MemoryAppends struct {
+	Global  string
+	User    string
+	Channel string
+}
 
 // ParsePlan extracts the policy and work instruction from a plan response.
 func ParsePlan(text string) (string, string, error) {
@@ -62,13 +73,18 @@ func ParsePlan(text string) (string, string, error) {
 	return policy, instruction, nil
 }
 
-// SplitMemoryAppend separates an optional trailing memory-append section from
-// a work response. When the section is absent or ambiguous (zero or multiple
-// headings), the original text is returned unchanged with an empty entry so
-// no memory write happens.
-func SplitMemoryAppend(text string) (rest, entry string) {
+// SplitMemoryAppends separates optional trailing scoped memory sections from
+// a work response. Sections must occur at most once and in global, user,
+// channel order. The legacy generic heading is treated as global memory.
+// Ambiguous output causes no memory writes and is stripped from the visible
+// result so a malformed user-memory proposal cannot leak into Slack.
+func SplitMemoryAppends(text string) (rest string, appends MemoryAppends, valid bool) {
 	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
-	var indexes []int
+	type section struct {
+		index int
+		scope int
+	}
+	var sections []section
 	inFence := false
 	var fence byte
 	var fenceLen int
@@ -88,18 +104,57 @@ func SplitMemoryAppend(text string) (rest, entry string) {
 		if inFence {
 			continue
 		}
-		if trimmed == memoryHeading {
-			indexes = append(indexes, i)
+		scope := -1
+		switch trimmed {
+		case memoryHeading, globalMemoryHeading:
+			scope = 0
+		case userMemoryHeading:
+			scope = 1
+		case channelMemoryHeading:
+			scope = 2
+		}
+		if scope >= 0 {
+			sections = append(sections, section{index: i, scope: scope})
 		}
 	}
 
-	if len(indexes) != 1 {
+	if len(sections) == 0 {
+		return text, MemoryAppends{}, true
+	}
+	result := strings.TrimSpace(strings.Join(lines[:sections[0].index], "\n"))
+	lastScope := -1
+	for _, section := range sections {
+		if section.scope <= lastScope {
+			return result, MemoryAppends{}, false
+		}
+		lastScope = section.scope
+	}
+
+	for i, section := range sections {
+		end := len(lines)
+		if i+1 < len(sections) {
+			end = sections[i+1].index
+		}
+		entry := strings.TrimSpace(strings.Join(lines[section.index+1:end], "\n"))
+		switch section.scope {
+		case 0:
+			appends.Global = entry
+		case 1:
+			appends.User = entry
+		case 2:
+			appends.Channel = entry
+		}
+	}
+	return result, appends, true
+}
+
+// SplitMemoryAppend preserves the original single-global-memory API.
+func SplitMemoryAppend(text string) (rest, entry string) {
+	rest, appends, valid := SplitMemoryAppends(text)
+	if !valid || appends.User != "" || appends.Channel != "" {
 		return text, ""
 	}
-	index := indexes[0]
-	rest = strings.TrimSpace(strings.Join(lines[:index], "\n"))
-	entry = strings.TrimSpace(strings.Join(lines[index+1:], "\n"))
-	return rest, entry
+	return rest, appends.Global
 }
 
 // fenceMarker reports the fence character and the number of times it is

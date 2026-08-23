@@ -2,7 +2,7 @@
 
 ## キーの定義(混同禁止)
 - **eventKey** = `channel:mention_ts`(mention メッセージ自身の ts)。events.json / ClaimEvent / Transition はすべてこのキー。mention 1 件 = 1 エントリなので、同一スレッド内の 2 件目以降の mention は独立に処理される
-- **threadKey** = `channel:(thread_ts||ts)`。sessions.json(codex threadID の resume)とスレッド mutex にのみ使用
+- **threadKey** = `channel:(thread_ts||ts):user`。sessions.json(codex threadID の resume)とスレッド mutex にのみ使用。共有Slackスレッドでもユーザー間で個別メモリやCodex会話コンテキストを混在させない
 
 ## 目的
 ebiclaw のミニマム版。Slack mention → codex で方針検討 → 別セッションで作業実行 → 同スレッドに結果返信。Web UI なし、env のみで設定。
@@ -63,13 +63,13 @@ events.json に `channel:ts` → `{state, updated_at}` を永続化。状態は
 2. フィルタリング: bot 自身・subtype 付き(bot_message/message_changed 等)・空テキストは無視。allowlist 検査(拒否はエラーログを残して終了)
 3. `ClaimEvent(eventKey)` 照合(上記状態機械)。claimed=false なら終了。**err の場合(永続化失敗)**: ACK 済みで再配信が期待できないため、スレッドに「受付に失敗したので再 mention してほしい」旨を投稿(投稿も失敗したらエラーログ)して終了
 4. 👀 付与(失敗はエラーログを残して続行)
-5. **Plan turn**(sandbox=read-only, cwd=EBIII_HOME): `Transition(eventKey, received, planning)` の永続化成功後に Runner を起動。threadKey で sessions.json を引き resume/new。スレッド mutex で直列化。memory は RWMutex の read lock を取って実行(work の書き込みと排他)
-   - プロンプト前置き: 絶対パスで MEMORY.md・playbook 一覧を提示、「該当 playbook を読んで従え」、出力契約の指示
+5. **Plan turn**(permission profile extends `:read-only`, cwd=EBIII_HOME/data/workspace): `Transition(eventKey, received, planning)` の永続化成功後に Runner を起動。バージョン付きthreadKeyで sessions.json を引き resume/new。分離導入前にEBIII_HOMEをcwdとしていたセッションは再利用しない。スレッド mutex で直列化。memory は RWMutex の read lock を取ってbotが読み込む(work の書き込みと排他)
+   - プロンプト前置き: 全体・現在ユーザー・現在チャンネルのメモリ内容を別々のデータブロックとして注入し、playbook 一覧と出力契約を提示
    - **出力契約**: 成功 turn の最後の agent_message を `## 方針` / `## 作業指示` の 2 見出しでパース。判定規則: 行頭見出しのみ・コードフェンス内は見出しと見なさない(行頭の ``` または ~~~ 3 文字以上でフェンス開始/終了をトグル。未閉フェンスは末尾まで続くと見なす)・各見出しちょうど 1 回・この順序・両セクション非空。`## 作業指示` の本文が `NONE` 単独行なら作業なし(→方針投稿後 done)
    - **パース失敗は fail-closed**: work を起動せず、plan 全文(Messages 空の場合は固定のエラー案内のみ)をスレッドに投稿して「作業指示を確定できなかったので指示を明確にして再 mention してほしい」と伝え、`planning → done` に遷移(**planning→done を正式遷移に追加**。fail-closed 専用の終端経路)
 6. 方針セクションをスレッドに投稿(→ `plan_posted`)
-7. **Work turn**(作業指示 ≠ NONE): 新規セッション、sandbox=workspace-write、cwd=EBIII_HOME/workspace、writable_roots=[EBIII_HOME/memory](いずれも起動時に絶対パス化済みの値を渡す)。グローバル work mutex と memory RWMutex は分離し、常に workMu → memoryMu(write)の順で取得(デッドロック規則)。全スレッド直列化。ロックは turn 全体+子プロセス終了確認まで保持。ロック待ちは timeout に含めない(待機中である旨は投稿しない=ミニマム)
-   - プロンプト: 作業指示全文 + 「重要な学びがあれば MEMORY.md に追記(なければ書かない)」
+7. **Work turn**(作業指示 ≠ NONE): 新規セッション、permission profile extends `:workspace`、cwd=EBIII_HOME/data/workspace、追加writable rootsは `EBIII_WRITABLE_ROOTS` のみ。memoryと重なるrootは起動時に拒否する。グローバル work mutex と memory RWMutex は分離し、常に workMu → memoryMu(write)の順で取得(デッドロック規則)。全スレッド直列化。ロックは turn 全体+子プロセス終了確認まで保持。ロック待ちは timeout に含めない(待機中である旨は投稿しない=ミニマム)
+   - プロンプト: 作業指示全文 + 全体・ユーザー・チャンネルのメモリ内容 + スコープ別メモリ追記契約。メモリファイルはbotだけが書く
 8. 結果(成功 turn の最終 message)をスレッドに返信(→ done)
 9. リアクション: ✅ or ❌ を追加してから 👀 削除(失敗はエラーログを残して続行)
 - 分割投稿は失敗チャンクのみリトライ(全文再送しない)
@@ -81,8 +81,12 @@ events.json に `channel:ts` → `{state, updated_at}` を永続化。状態は
 - shutdown: 受付 ctx と turn ctx を分離。SIGINT → socketmode 停止(受付 ctx cancel、以後 WaitGroup.Add しない: Add は受付ループ内のみで行い、ループ停止後に Wait する構造)→ WaitGroup を 60s 待つ → 超過で turn ctx cancel → 子プロセス終了確認
 - メッセージは 3900 字で分割投稿
 
-## メモリ / Playbook(ミニマム化)
-- メモリは **単一 `memory/MEMORY.md`**(topics/ はやめる)。「価値ある学びのみ追記」とプロンプトで指示
+## メモリ / Playbook
+- 全体メモリは `data/memory/MEMORY.md`、ユーザーメモリは `data/memory/users/{userID}/MEMORY.md`、チャンネルメモリは `data/memory/channels/{channelID}/MEMORY.md`
+- モデルはIDやパスを指定せず、スコープ別見出しで追記を提案する。botが現在のSlack event user/channel IDを検証して保存先を決定する
+- Codex CLIは `--ignore-user-config` と専用permission profileで起動し、memory絶対パスを明示的に `deny` する。現在スコープの内容だけをbotがプロンプトへ注入する
+- workspace / 追加writable rootsとmemoryの重複は、未作成の末尾を許容しつつ既存prefixのsymlinkを解決して起動時に拒否する
+- ユーザーメモリは本人が明示した非機密の安定情報、チャンネルメモリは参加者で共有してよい情報、全体メモリは横断的に再利用できる知識だけを対象とする
 - playbooks/*.md(frontmatter name/description)。**起動時に一覧生成**(再走査しない。追加したら再起動)。走査はファイル名ソート、1 ファイル 64KB 超は一覧から除外して警告ログ
 - プロンプト内でユーザー入力は `<user_message>` ブロックに隔離(命令境界の明示。主防御はあくまで fail-closed とサンドボックス)
 
@@ -95,11 +99,12 @@ CODEX_COMMAND=codex                # 実行ファイルパスのみ(引数不可
 CODEX_MODEL=
 CODEX_TIMEOUT=30m
 EBIII_HOME=.
+EBIII_WRITABLE_ROOTS=              # 任意。memory本体・親・子との重複は禁止
 ```
 Slack scope: app_mentions:read, chat:write, reactions:write
 
 ## テスト
-- runner: 引数構築(new/resume/sandbox/writable_roots)、JSONL パース(completed/failed/error/上限超過)、onThreadStarted 発火
+- runner: 引数構築(new/resume/permission profile/read deny/writable roots)、JSONL パース(completed/failed/error/上限超過)、onThreadStarted 発火
 - 出力契約パーサ: 正常/見出し欠落/順序違い/同一見出し複数出現/空セクション/コードフェンス内見出し(未閉フェンス含む)/本文中の同名見出し(行頭以外)/NONE+余談
 - state store: ClaimEvent の原子性(並行 claim で 1 件のみ成功)、起動時リカバリ(working→interrupted、他→failed、保存失敗で fail-fast)
 - state store: atomic write、破損 fail-fast、状態遷移と再配信挙動、7 日 GC

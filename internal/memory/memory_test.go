@@ -34,7 +34,7 @@ func TestReadReturnsTrimmedContent(t *testing.T) {
 
 func TestReadCapsOversizedContent(t *testing.T) {
 	dir := t.TempDir()
-	content := strings.Repeat("界", maxPromptBytes)
+	content := "old-entry\n" + strings.Repeat("界", maxPromptBytes) + "\nnew-entry"
 	if err := os.WriteFile(filepath.Join(dir, FileName), []byte(content), 0o644); err != nil {
 		t.Fatalf("write memory: %v", err)
 	}
@@ -50,6 +50,75 @@ func TestReadCapsOversizedContent(t *testing.T) {
 	}
 	if !strings.Contains(got, "省略") {
 		t.Error("Read() missing truncation marker")
+	}
+	if strings.Contains(got, "old-entry") || !strings.Contains(got, "new-entry") {
+		t.Fatalf("Read() = %q, want newest entries only", got)
+	}
+}
+
+func TestReadContextSeparatesScopes(t *testing.T) {
+	root := t.TempDir()
+	entries := []struct {
+		scope Scope
+		text  string
+	}{
+		{scope: ScopeGlobal, text: "global fact"},
+		{scope: ScopeUser, text: "user preference"},
+		{scope: ScopeChannel, text: "channel convention"},
+	}
+	for _, entry := range entries {
+		if _, err := AppendScoped(root, entry.scope, "U123", "C456", entry.text); err != nil {
+			t.Fatalf("AppendScoped(%s) error = %v", entry.scope, err)
+		}
+	}
+
+	got, err := ReadContext(root, "U123", "C456")
+	if err != nil {
+		t.Fatalf("ReadContext() error = %v", err)
+	}
+	if got.Global != "global fact" || got.User != "user preference" || got.Channel != "channel convention" {
+		t.Fatalf("ReadContext() = %#v", got)
+	}
+	other, err := ReadContext(root, "U999", "C999")
+	if err != nil {
+		t.Fatalf("ReadContext(other) error = %v", err)
+	}
+	if other.Global != "global fact" || other.User != "" || other.Channel != "" {
+		t.Fatalf("ReadContext(other) = %#v", other)
+	}
+}
+
+func TestScopeDirRejectsUnsafeIDs(t *testing.T) {
+	tests := []struct {
+		name  string
+		scope Scope
+		id    string
+	}{
+		{name: "user traversal", scope: ScopeUser, id: "U../other"},
+		{name: "wrong user prefix", scope: ScopeUser, id: "C123"},
+		{name: "channel traversal", scope: ScopeChannel, id: "C/other"},
+		{name: "unknown scope", scope: Scope("other")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := ScopeDir(t.TempDir(), test.scope, test.id); err == nil {
+				t.Fatal("ScopeDir() error = nil, want validation error")
+			}
+		})
+	}
+}
+
+func TestReadContextReturnsOtherScopesWhenOneFails(t *testing.T) {
+	root := t.TempDir()
+	if _, err := AppendScoped(root, ScopeGlobal, "U1", "C1", "global fact"); err != nil {
+		t.Fatalf("append global: %v", err)
+	}
+	got, err := ReadContext(root, "unsafe/user", "C1")
+	if err == nil {
+		t.Fatalf("ReadContext() error = %v, want validation error", err)
+	}
+	if got.Global != "global fact" {
+		t.Fatalf("ReadContext() global = %q", got.Global)
 	}
 }
 

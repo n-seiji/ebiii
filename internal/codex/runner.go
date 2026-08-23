@@ -27,6 +27,10 @@ const (
 type Runner struct {
 	Command string
 	Model   string
+	// DeniedReadPaths are protected backing stores that model-generated
+	// commands must not read or write. They are enforced with a Codex
+	// permission profile, independently of prompt instructions.
+	DeniedReadPaths []string
 	// DeveloperInstructions is injected into each session with the
 	// "developer" role, which outranks user messages and AGENTS.md in the
 	// model's chain of command. Codex stores it once per thread, so passing
@@ -50,7 +54,7 @@ func (r *Runner) Run(
 	prompt string,
 	onThreadStarted func(id string) error,
 ) (*TurnResult, error) {
-	args := buildArgs(threadID, sandbox, cwd, writableRoots, r.Model, r.DeveloperInstructions)
+	args := buildArgs(threadID, sandbox, cwd, writableRoots, r.DeniedReadPaths, r.Model, r.DeveloperInstructions)
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -96,7 +100,7 @@ func (r *Runner) Run(
 	return result, nil
 }
 
-func buildArgs(threadID, sandbox, cwd string, writableRoots []string, model, developerInstructions string) []string {
+func buildArgs(threadID, sandbox, cwd string, writableRoots, deniedReadPaths []string, model, developerInstructions string) []string {
 	args := []string{"exec"}
 	if threadID != "" {
 		args = append(args, "resume", threadID)
@@ -104,14 +108,26 @@ func buildArgs(threadID, sandbox, cwd string, writableRoots []string, model, dev
 	args = append(args,
 		"--json",
 		"--skip-git-repo-check",
-		"-c", fmt.Sprintf("sandbox_mode=%q", sandbox),
+		// A user config containing legacy sandbox_mode disables permission
+		// profiles. Ignore it so the deny rules below cannot be weakened by
+		// machine-local Codex settings; authentication still uses CODEX_HOME.
+		"--ignore-user-config",
 		"-c", `approval_policy="never"`,
+		"-c", `default_permissions="ebiii"`,
 	)
+	parentProfile := ":read-only"
+	if sandbox == "workspace-write" {
+		parentProfile = ":workspace"
+	}
+	args = append(args, "-c", "permissions.ebiii.extends="+strconv.Quote(parentProfile))
+	for _, path := range deniedReadPaths {
+		args = append(args, "-c", "permissions.ebiii.filesystem."+strconv.Quote(path)+`="deny"`)
+	}
 	if developerInstructions != "" {
 		args = append(args, "-c", "developer_instructions="+strconv.Quote(developerInstructions))
 	}
 	if sandbox == "workspace-write" {
-		args = append(args, "-c", "sandbox_workspace_write.network_access=true")
+		args = append(args, "-c", "permissions.ebiii.network.enabled=true")
 		for _, root := range writableRoots {
 			args = append(args, "--add-dir", root)
 		}

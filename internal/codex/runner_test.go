@@ -20,18 +20,22 @@ func TestBuildArgs(t *testing.T) {
 		sandbox       string
 		cwd           string
 		writableRoots []string
+		deniedPaths   []string
 		model         string
 		instructions  string
 		want          []string
 	}{
 		{
-			name:    "new read-only without model",
-			sandbox: "read-only",
-			cwd:     "/work",
+			name:        "new read-only without model",
+			sandbox:     "read-only",
+			cwd:         "/work",
+			deniedPaths: []string{"/private/memory"},
 			want: []string{
-				"exec", "--json", "--skip-git-repo-check",
-				"-c", `sandbox_mode="read-only"`,
+				"exec", "--json", "--skip-git-repo-check", "--ignore-user-config",
 				"-c", `approval_policy="never"`,
+				"-c", `default_permissions="ebiii"`,
+				"-c", `permissions.ebiii.extends=":read-only"`,
+				"-c", `permissions.ebiii.filesystem."/private/memory"="deny"`,
 				"-C", "/work", "-",
 			},
 		},
@@ -39,11 +43,14 @@ func TestBuildArgs(t *testing.T) {
 			name:         "developer instructions are quoted",
 			sandbox:      "read-only",
 			cwd:          "/work",
+			deniedPaths:  []string{"/private/memory"},
 			instructions: "絶対ルール\n\"quoted\"",
 			want: []string{
-				"exec", "--json", "--skip-git-repo-check",
-				"-c", `sandbox_mode="read-only"`,
+				"exec", "--json", "--skip-git-repo-check", "--ignore-user-config",
 				"-c", `approval_policy="never"`,
+				"-c", `default_permissions="ebiii"`,
+				"-c", `permissions.ebiii.extends=":read-only"`,
+				"-c", `permissions.ebiii.filesystem."/private/memory"="deny"`,
 				"-c", `developer_instructions="絶対ルール\n\"quoted\""`,
 				"-C", "/work", "-",
 			},
@@ -52,14 +59,17 @@ func TestBuildArgs(t *testing.T) {
 			name:          "new workspace-write with roots and model",
 			sandbox:       "workspace-write",
 			cwd:           "/work",
-			writableRoots: []string{"/memory", `/a"b`},
+			writableRoots: []string{"/extra", `/a"b`},
+			deniedPaths:   []string{"/private/memory"},
 			model:         "gpt-test",
 			want: []string{
-				"exec", "--json", "--skip-git-repo-check",
-				"-c", `sandbox_mode="workspace-write"`,
+				"exec", "--json", "--skip-git-repo-check", "--ignore-user-config",
 				"-c", `approval_policy="never"`,
-				"-c", "sandbox_workspace_write.network_access=true",
-				"--add-dir", "/memory",
+				"-c", `default_permissions="ebiii"`,
+				"-c", `permissions.ebiii.extends=":workspace"`,
+				"-c", `permissions.ebiii.filesystem."/private/memory"="deny"`,
+				"-c", "permissions.ebiii.network.enabled=true",
+				"--add-dir", "/extra",
 				"--add-dir", `/a"b`,
 				"-m", "gpt-test", "-C", "/work", "-",
 			},
@@ -69,11 +79,14 @@ func TestBuildArgs(t *testing.T) {
 			sandbox:       "workspace-write",
 			cwd:           "/work",
 			writableRoots: []string{"/a dir", "/b/c", "/d e/f"},
+			deniedPaths:   []string{"/private/memory"},
 			want: []string{
-				"exec", "--json", "--skip-git-repo-check",
-				"-c", `sandbox_mode="workspace-write"`,
+				"exec", "--json", "--skip-git-repo-check", "--ignore-user-config",
 				"-c", `approval_policy="never"`,
-				"-c", "sandbox_workspace_write.network_access=true",
+				"-c", `default_permissions="ebiii"`,
+				"-c", `permissions.ebiii.extends=":workspace"`,
+				"-c", `permissions.ebiii.filesystem."/private/memory"="deny"`,
+				"-c", "permissions.ebiii.network.enabled=true",
 				"--add-dir", "/a dir",
 				"--add-dir", "/b/c",
 				"--add-dir", "/d e/f",
@@ -81,14 +94,17 @@ func TestBuildArgs(t *testing.T) {
 			},
 		},
 		{
-			name:    "workspace-write without roots omits add-dir",
-			sandbox: "workspace-write",
-			cwd:     "/work",
+			name:        "workspace-write without roots omits add-dir",
+			sandbox:     "workspace-write",
+			cwd:         "/work",
+			deniedPaths: []string{"/private/memory"},
 			want: []string{
-				"exec", "--json", "--skip-git-repo-check",
-				"-c", `sandbox_mode="workspace-write"`,
+				"exec", "--json", "--skip-git-repo-check", "--ignore-user-config",
 				"-c", `approval_policy="never"`,
-				"-c", "sandbox_workspace_write.network_access=true",
+				"-c", `default_permissions="ebiii"`,
+				"-c", `permissions.ebiii.extends=":workspace"`,
+				"-c", `permissions.ebiii.filesystem."/private/memory"="deny"`,
+				"-c", "permissions.ebiii.network.enabled=true",
 				"-C", "/work", "-",
 			},
 		},
@@ -97,10 +113,13 @@ func TestBuildArgs(t *testing.T) {
 			sandbox:       "read-only",
 			cwd:           "/work",
 			writableRoots: []string{"/memory"},
+			deniedPaths:   []string{"/private/memory"},
 			want: []string{
-				"exec", "--json", "--skip-git-repo-check",
-				"-c", `sandbox_mode="read-only"`,
+				"exec", "--json", "--skip-git-repo-check", "--ignore-user-config",
 				"-c", `approval_policy="never"`,
+				"-c", `default_permissions="ebiii"`,
+				"-c", `permissions.ebiii.extends=":read-only"`,
+				"-c", `permissions.ebiii.filesystem."/private/memory"="deny"`,
 				"-C", "/work", "-",
 			},
 		},
@@ -109,14 +128,17 @@ func TestBuildArgs(t *testing.T) {
 			threadID:      "thread-1",
 			sandbox:       "workspace-write",
 			cwd:           "/ignored",
-			writableRoots: []string{"/memory"},
+			writableRoots: []string{"/extra"},
+			deniedPaths:   []string{"/private/memory"},
 			model:         "gpt-test",
 			want: []string{
-				"exec", "resume", "thread-1", "--json", "--skip-git-repo-check",
-				"-c", `sandbox_mode="workspace-write"`,
+				"exec", "resume", "thread-1", "--json", "--skip-git-repo-check", "--ignore-user-config",
 				"-c", `approval_policy="never"`,
-				"-c", "sandbox_workspace_write.network_access=true",
-				"--add-dir", "/memory",
+				"-c", `default_permissions="ebiii"`,
+				"-c", `permissions.ebiii.extends=":workspace"`,
+				"-c", `permissions.ebiii.filesystem."/private/memory"="deny"`,
+				"-c", "permissions.ebiii.network.enabled=true",
+				"--add-dir", "/extra",
 				"-m", "gpt-test", "-",
 			},
 		},
@@ -124,7 +146,7 @@ func TestBuildArgs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := buildArgs(tt.threadID, tt.sandbox, tt.cwd, tt.writableRoots, tt.model, tt.instructions)
+			got := buildArgs(tt.threadID, tt.sandbox, tt.cwd, tt.writableRoots, tt.deniedPaths, tt.model, tt.instructions)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("buildArgs() = %#v, want %#v", got, tt.want)
 			}

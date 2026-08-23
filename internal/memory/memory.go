@@ -1,10 +1,11 @@
-// Package memory reads and appends the persistent MEMORY.md file. The Codex
-// agent never writes this file directly; the bot validates proposed entries
-// and appends them itself so Slack input cannot rewrite accumulated memory.
+// Package memory reads and appends global, user, and channel MEMORY.md files.
+// The Codex agent never writes these files directly; the bot validates
+// proposed entries and routes them from authenticated Slack event IDs.
 package memory
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,10 +17,94 @@ const FileName = "MEMORY.md"
 
 const (
 	// maxPromptBytes caps how much memory content is injected into prompts.
-	maxPromptBytes = 16 << 10
+	maxPromptBytes = 8 << 10
 	// MaxAppendBytes caps the size of one appended entry.
 	MaxAppendBytes = 4 << 10
 )
+
+// Scope identifies who may reuse a memory entry.
+type Scope string
+
+const (
+	ScopeGlobal  Scope = "global"
+	ScopeUser    Scope = "user"
+	ScopeChannel Scope = "channel"
+)
+
+// Context contains the memory visible to one Slack request.
+type Context struct {
+	Global  string
+	User    string
+	Channel string
+}
+
+// ReadContext reads global memory plus the memory belonging to the current
+// Slack user and channel. Successfully read scopes are returned even when a
+// different scope fails.
+func ReadContext(root, userID, channelID string) (Context, error) {
+	var result Context
+	var errs []error
+	for _, target := range []struct {
+		scope Scope
+		id    string
+		set   func(string)
+	}{
+		{scope: ScopeGlobal, set: func(value string) { result.Global = value }},
+		{scope: ScopeUser, id: userID, set: func(value string) { result.User = value }},
+		{scope: ScopeChannel, id: channelID, set: func(value string) { result.Channel = value }},
+	} {
+		dir, err := ScopeDir(root, target.scope, target.id)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		value, err := Read(dir)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("read %s memory: %w", target.scope, err))
+			continue
+		}
+		target.set(value)
+	}
+	return result, errors.Join(errs...)
+}
+
+// AppendScoped appends to the scope belonging to the current Slack request.
+// IDs are never supplied by the model; the bot passes the authenticated event
+// user and channel IDs so an output cannot select another scope's directory.
+func AppendScoped(root string, scope Scope, userID, channelID, entry string) (string, error) {
+	id := ""
+	switch scope {
+	case ScopeUser:
+		id = userID
+	case ScopeChannel:
+		id = channelID
+	}
+	dir, err := ScopeDir(root, scope, id)
+	if err != nil {
+		return "", err
+	}
+	return Append(dir, entry)
+}
+
+// ScopeDir resolves a memory scope to a directory below root.
+func ScopeDir(root string, scope Scope, id string) (string, error) {
+	switch scope {
+	case ScopeGlobal:
+		return root, nil
+	case ScopeUser:
+		if !validSlackID(id, "U") {
+			return "", fmt.Errorf("invalid Slack user ID %q", id)
+		}
+		return filepath.Join(root, "users", id), nil
+	case ScopeChannel:
+		if !validSlackID(id, "CGD") {
+			return "", fmt.Errorf("invalid Slack channel ID %q", id)
+		}
+		return filepath.Join(root, "channels", id), nil
+	default:
+		return "", fmt.Errorf("invalid memory scope %q", scope)
+	}
+}
 
 // Read returns the memory file content capped at maxPromptBytes. A missing
 // file yields an empty string without error.
@@ -33,7 +118,7 @@ func Read(dir string) (string, error) {
 	}
 	text := string(data)
 	if len(text) > maxPromptBytes {
-		text = truncateRunes(text, maxPromptBytes) + "\n(以降はサイズ上限のため省略)"
+		text = "(前半はサイズ上限のため省略)\n" + truncateTailRunes(text, maxPromptBytes)
 	}
 	return strings.TrimSpace(text), nil
 }
@@ -53,10 +138,10 @@ func Append(dir, entry string) (written string, err error) {
 	if len(entry) > MaxAppendBytes {
 		entry = strings.TrimSpace(truncateRunes(entry, MaxAppendBytes)) + "\n(サイズ上限のため切り詰め)"
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	file, err := os.OpenFile(filepath.Join(dir, FileName), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	file, err := os.OpenFile(filepath.Join(dir, FileName), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return "", err
 	}
@@ -80,4 +165,27 @@ func truncateRunes(text string, limit int) string {
 		end--
 	}
 	return text[:end]
+}
+
+func truncateTailRunes(text string, limit int) string {
+	if len(text) <= limit {
+		return text
+	}
+	start := len(text) - limit
+	for start < len(text) && !utf8.RuneStart(text[start]) {
+		start++
+	}
+	return text[start:]
+}
+
+func validSlackID(id, prefixes string) bool {
+	if len(id) < 2 || !strings.ContainsRune(prefixes, rune(id[0])) {
+		return false
+	}
+	for i := 1; i < len(id); i++ {
+		if (id[i] < 'A' || id[i] > 'Z') && (id[i] < '0' || id[i] > '9') {
+			return false
+		}
+	}
+	return true
 }

@@ -42,12 +42,12 @@ func main() {
 	runner := &codex.Runner{
 		Command:               cfg.CodexCommand,
 		Model:                 cfg.CodexModel,
+		DeniedReadPaths:       []string{cfg.MemoryDir},
 		DeveloperInstructions: policy.Instructions(),
 	}
 	bot := slackbot.New(nil, store, runner, slackbot.Config{
 		AllowedUserIDs:    cfg.AllowedUserIDs,
 		AllowedChannelIDs: cfg.AllowedChannelIDs,
-		EBIIIHome:         cfg.EBIIIHome,
 		WorkspaceDir:      cfg.WorkspaceDir,
 		MemoryDir:         cfg.MemoryDir,
 		CodexTimeout:      cfg.CodexTimeout,

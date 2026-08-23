@@ -258,6 +258,73 @@ func TestLoadWritableRoots(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsMemoryOverlappingWritableRoots(t *testing.T) {
+	tests := []struct {
+		name     string
+		rootPath func(home string) string
+	}{
+		{name: "memory directory", rootPath: func(home string) string {
+			return filepath.Join(home, "data", "memory")
+		}},
+		{name: "memory parent", rootPath: func(home string) string {
+			return filepath.Join(home, "data")
+		}},
+		{name: "memory child", rootPath: func(home string) string {
+			return filepath.Join(home, "data", "memory", "users")
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workingDir := t.TempDir()
+			withWorkingDir(t, workingDir)
+			clearConfigEnv(t)
+			home := filepath.Join(workingDir, "home")
+			for _, dir := range []string{
+				filepath.Join(home, "data", "workspace"),
+				filepath.Join(home, "data", "memory", "users"),
+			} {
+				if err := os.MkdirAll(dir, 0o700); err != nil {
+					t.Fatalf("MkdirAll(%q) error = %v", dir, err)
+				}
+			}
+			t.Setenv("SLACK_BOT_TOKEN", "xoxb-test")
+			t.Setenv("SLACK_APP_TOKEN", "xapp-test")
+			t.Setenv("SLACK_ALLOWED_USER_IDS", "U123")
+			t.Setenv("EBIII_HOME", home)
+			t.Setenv("EBIII_WRITABLE_ROOTS", tt.rootPath(home))
+
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "overlaps protected memory directory") {
+				t.Fatalf("Load() error = %v, want protected memory overlap", err)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsSymlinkedMemoryWritableRoot(t *testing.T) {
+	workingDir := t.TempDir()
+	withWorkingDir(t, workingDir)
+	clearConfigEnv(t)
+	home := filepath.Join(workingDir, "home")
+	memoryDir := filepath.Join(home, "data", "memory")
+	if err := os.MkdirAll(memoryDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", memoryDir, err)
+	}
+	link := filepath.Join(workingDir, "memory-link")
+	if err := os.Symlink(memoryDir, link); err != nil {
+		t.Fatalf("Symlink(%q) error = %v", link, err)
+	}
+	t.Setenv("SLACK_BOT_TOKEN", "xoxb-test")
+	t.Setenv("SLACK_APP_TOKEN", "xapp-test")
+	t.Setenv("SLACK_ALLOWED_USER_IDS", "U123")
+	t.Setenv("EBIII_HOME", home)
+	t.Setenv("EBIII_WRITABLE_ROOTS", link)
+
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "overlaps protected memory directory") {
+		t.Fatalf("Load() error = %v, want protected memory overlap", err)
+	}
+}
+
 func TestLoadDotEnv(t *testing.T) {
 	workingDir := t.TempDir()
 	withWorkingDir(t, workingDir)

@@ -5,7 +5,7 @@ ebiii は、Slack の mention を受けて Codex が方針を検討し、必要�
 ## Slack App の準備
 
 1. Slack App を作成し、Socket Mode を有効にします。
-2. Bot Token Scopes に `app_mentions:read`、`chat:write`、`reactions:write` を追加します。
+2. Bot Token Scopes に `app_mentions:read`、`chat:write`、`reactions:write`、`channels:history`、`groups:history` を追加します。scopeを追加した場合は、workspaceへアプリを再インストールしてください。
 3. Event Subscriptions で `app_mention` を購読します。
 4. Workspace に App をインストールして Bot Token (`xoxb-...`) を取得します。
 5. Socket Mode 用の App Token (`xapp-...`) を取得します。
@@ -20,9 +20,27 @@ mise run build   # または: go build -o ebiii ./cmd/ebiii
 ./ebiii
 ```
 
-Go のバージョンは [mise](https://mise.jdx.dev/) で管理しています(`mise install` で揃います)。テストは `mise run test`、lint は `mise run lint` で実行できます。mise なしでも `go build` / `go test -race ./...` / `go vet ./...` で同等です。
+Go のバージョンは [mise](https://mise.jdx.dev/) で管理しています(`mise install` で揃います)。テストは `mise run test`、lint は `mise run lint` で実行できます。mise なしでも `go build` / `go test -race ./...` / `go vet ./...` で同等です。メモリの読み取り分離には permission profile と `--ignore-user-config` を使うため、Codex CLI 0.149.0 以上が必要です。
 
 ebiii は単一プロセスでの運用を前提としており、多重起動には対応していません。
+
+## メモリ
+
+ebiii は作業で得た長期的に有用な情報を、次の3スコープに分けて保存します。
+
+```text
+data/memory/MEMORY.md                     # 全ユーザー・全チャンネル共通
+data/memory/users/{Slack user ID}/MEMORY.md
+data/memory/channels/{Slack channel ID}/MEMORY.md
+```
+
+- 全体メモリ: 他のユーザーやチャンネルでも再利用できる技術的・運用上の知識
+- ユーザーメモリ: 本人が明示した、どの許可済みチャンネルで利用してもよい安定的な好みや追加情報
+- チャンネルメモリ: そのチャンネルの参加者で共有してよい用語・目的・運用ルール
+
+Codex はメモリファイルを直接読み書きしません。bot だけが現在のSlack user/channel IDに対応する内容を読み、プロンプトへ注入します。Codex の全 turn ではユーザー設定を読み込まない専用 permission profile を使い、`data/memory` の絶対パスを read/write ともに deny します。`EBIII_WRITABLE_ROOTS` がmemory本体・親・子と重なる場合も、シンボリックリンクを解決したうえで起動を拒否します。
+
+Codex は最終応答で追記を提案し、bot が保存先を決定します。認証情報、秘密、一時的な依頼内容、推測したセンシティブ属性は保存対象外です。既存の `data/memory/MEMORY.md` はそのまま全体メモリとして使用されます。分離導入前のCodexセッションは再利用せず、導入後の最初のmentionから新しいセッションになります。
 
 ## interrupted の運用
 
