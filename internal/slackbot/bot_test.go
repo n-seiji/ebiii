@@ -140,12 +140,16 @@ type fakeRunner struct {
 	cwds      []string
 	roots     [][]string
 	prompts   []string
+	onRun     func(call int)
 }
 
 func (r *fakeRunner) Run(_ context.Context, threadID, sandbox, cwd string, roots []string, prompt string, callback func(string) error) (*codex.TurnResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls++
+	if r.onRun != nil {
+		r.onRun(r.calls)
+	}
 	r.threadIDs = append(r.threadIDs, threadID)
 	r.sandboxes = append(r.sandboxes, sandbox)
 	r.cwds = append(r.cwds, cwd)
@@ -291,6 +295,11 @@ func TestPlanWorkDone(t *testing.T) {
 		}},
 		{result: &codex.TurnResult{Completed: true, Messages: []string{"Work completed."}}},
 	}}
+	runner.onRun = func(call int) {
+		if call == 2 && len(api.postTexts) != 0 {
+			t.Fatalf("posts before work started = %q, want none", api.postTexts)
+		}
+	}
 	newTestBot(t, store, api, runner).HandleMention(context.Background(), mention())
 	assertTransitions(t, store.transitions, [][2]state.State{
 		{state.Received, state.Planning},
@@ -301,7 +310,7 @@ func TestPlanWorkDone(t *testing.T) {
 	if runner.calls != 2 {
 		t.Fatalf("runner calls = %d, want 2", runner.calls)
 	}
-	if got := strings.Join(api.postTexts, "|"); got != "Implement safely.|Work completed." {
+	if got := strings.Join(api.postTexts, "|"); got != "Work completed." {
 		t.Fatalf("posts = %q", got)
 	}
 	if runner.roots[0] != nil || runner.roots[1] != nil {
@@ -431,7 +440,7 @@ func TestFormatThreadContextCapsRunesAndKeepsEnds(t *testing.T) {
 	}
 }
 
-func TestKeepStatusRetriesThenRefreshes(t *testing.T) {
+func TestKeepStatusRefreshesUntilStopped(t *testing.T) {
 	api := &fakeSlack{}
 	bot := newTestBot(t, &fakeStore{}, api, &fakeRunner{})
 	sleepCalls := make(chan time.Duration)
@@ -451,20 +460,16 @@ func TestKeepStatusRetriesThenRefreshes(t *testing.T) {
 	}
 
 	stop := bot.keepStatus(context.Background(), "C1", "100.1", workingStatus)
-	if got := receiveDuration(t, sleepCalls); got != statusRetryDelay {
-		t.Fatalf("first status delay = %v, want %v", got, statusRetryDelay)
+	if got := receiveDuration(t, sleepCalls); got != statusRefreshDelay {
+		t.Fatalf("first status delay = %v, want %v", got, statusRefreshDelay)
 	}
 	releaseSleep <- struct{}{}
 	if got := receiveDuration(t, sleepCalls); got != statusRefreshDelay {
 		t.Fatalf("second status delay = %v, want %v", got, statusRefreshDelay)
 	}
-	releaseSleep <- struct{}{}
-	if got := receiveDuration(t, sleepCalls); got != statusRefreshDelay {
-		t.Fatalf("third status delay = %v, want %v", got, statusRefreshDelay)
-	}
 	stop()
 
-	assertStatusSequence(t, api.calls, []string{workingStatus, workingStatus, workingStatus})
+	assertStatusSequence(t, api.calls, []string{workingStatus, workingStatus})
 }
 
 func TestWorkTurnReceivesWritableRootsAndPlanTurnDoesNot(t *testing.T) {
@@ -499,8 +504,8 @@ func TestWorkTurnReceivesWritableRootsAndPlanTurnDoesNot(t *testing.T) {
 	if got := runner.cwds[0]; got != "/repo/workspace" {
 		t.Errorf("plan turn cwd = %q, want isolated workspace", got)
 	}
-	if got := runner.sandboxes[0]; got != "read-only" {
-		t.Errorf("plan turn sandbox = %q, want read-only", got)
+	if got := runner.sandboxes[0]; got != "read-only-network" {
+		t.Errorf("plan turn sandbox = %q, want read-only-network", got)
 	}
 	want := []string{"/extra/one", "/extra/two"}
 	if !reflect.DeepEqual(runner.roots[1], want) {

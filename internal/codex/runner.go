@@ -130,8 +130,10 @@ func buildArgs(threadID, sandbox, cwd string, writableRoots, deniedReadPaths []s
 	if developerInstructions != "" {
 		args = append(args, "-c", "developer_instructions="+strconv.Quote(developerInstructions))
 	}
-	if sandbox == "workspace-write" {
+	if sandbox == "workspace-write" || sandbox == "read-only-network" {
 		args = append(args, "-c", "permissions.ebiii.network.enabled=true")
+	}
+	if sandbox == "workspace-write" {
 		for _, root := range writableRoots {
 			args = append(args, "--add-dir", root)
 		}

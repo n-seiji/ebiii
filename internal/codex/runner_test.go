@@ -109,6 +109,21 @@ func TestBuildArgs(t *testing.T) {
 			},
 		},
 		{
+			name:        "read-only network keeps filesystem read-only",
+			sandbox:     "read-only-network",
+			cwd:         "/work",
+			deniedPaths: []string{"/private/memory"},
+			want: []string{
+				"exec", "--json", "--skip-git-repo-check", "--ignore-user-config",
+				"-c", `approval_policy="never"`,
+				"-c", `default_permissions="ebiii"`,
+				"-c", `permissions.ebiii.extends=":read-only"`,
+				"-c", `permissions.ebiii.filesystem={"/private/memory"="deny"}`,
+				"-c", "permissions.ebiii.network.enabled=true",
+				"-C", "/work", "-",
+			},
+		},
+		{
 			name:          "read-only ignores roots",
 			sandbox:       "read-only",
 			cwd:           "/work",
