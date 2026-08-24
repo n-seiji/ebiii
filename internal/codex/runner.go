@@ -120,8 +120,12 @@ func buildArgs(threadID, sandbox, cwd string, writableRoots, deniedReadPaths []s
 		parentProfile = ":workspace"
 	}
 	args = append(args, "-c", "permissions.ebiii.extends="+strconv.Quote(parentProfile))
-	for _, path := range deniedReadPaths {
-		args = append(args, "-c", "permissions.ebiii.filesystem."+strconv.Quote(path)+`="deny"`)
+	if len(deniedReadPaths) > 0 {
+		entries := make([]string, 0, len(deniedReadPaths))
+		for _, path := range deniedReadPaths {
+			entries = append(entries, strconv.Quote(path)+`="deny"`)
+		}
+		args = append(args, "-c", "permissions.ebiii.filesystem={"+strings.Join(entries, ",")+"}")
 	}
 	if developerInstructions != "" {
 		args = append(args, "-c", "developer_instructions="+strconv.Quote(developerInstructions))

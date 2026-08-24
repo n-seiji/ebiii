@@ -1,5 +1,6 @@
 [tools]
 go = "1.27"
+node = "latest"
 
 [env]
 CGO_ENABLED = "0"

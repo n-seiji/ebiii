@@ -9,3 +9,6 @@
 
 # Local GitHub App authentication workflow
 /.agents/skills/github-app-repositories/
+
+.codex/
+docs/
