@@ -235,6 +235,13 @@ func TestSubscriptionLifecycle(t *testing.T) {
 	if _, ok := reloaded.GetSubscription("C123:500.001"); ok {
 		t.Error("GetSubscription() after DeleteSubscription() found a subscription, want none")
 	}
+	reloaded, err = NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore() after DeleteSubscription() error = %v, want nil", err)
+	}
+	if _, ok := reloaded.GetSubscription("C123:500.001"); ok {
+		t.Error("reloaded GetSubscription() after DeleteSubscription() found a subscription, want none")
+	}
 }
 
 func TestGCRemovesExpiredSubscriptions(t *testing.T) {
@@ -269,6 +276,58 @@ func TestGCRemovesExpiredSubscriptions(t *testing.T) {
 		if _, ok := reloaded.GetSubscription(key); !ok {
 			t.Errorf("GC() removed active subscription %q, want retained", key)
 		}
+	}
+}
+
+func TestGCKeepsEventCleanupAfterSubscriptionSaveFailure(t *testing.T) {
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v, want nil", err)
+	}
+	store.events["C123:700.001"] = event{State: Done, UpdatedAt: now.Add(-8 * 24 * time.Hour)}
+	if err := store.saveEvents(); err != nil {
+		t.Fatalf("saveEvents() setup error = %v, want nil", err)
+	}
+	if err := store.SetSubscription("C123:700.002", now.Add(-time.Hour), now.Add(-time.Second)); err != nil {
+		t.Fatalf("SetSubscription() setup error = %v, want nil", err)
+	}
+
+	subscriptionsPath := filepath.Join(dir, subscriptionsFilename)
+	if err := os.Remove(subscriptionsPath); err != nil {
+		t.Fatalf("Remove() subscriptions file error = %v, want nil", err)
+	}
+	if err := os.Mkdir(subscriptionsPath, 0o700); err != nil {
+		t.Fatalf("Mkdir() subscriptions blocker error = %v, want nil", err)
+	}
+
+	err = store.GC(now, 7*24*time.Hour)
+	if err == nil {
+		t.Fatal("GC() error = nil, want non-nil")
+	}
+	if _, ok := store.events["C123:700.001"]; ok {
+		t.Error("GC() restored an event whose cleanup was already saved")
+	}
+	if _, ok := store.GetSubscription("C123:700.002"); !ok {
+		t.Error("GC() did not restore the subscription whose save failed")
+	}
+
+	if err := os.Remove(subscriptionsPath); err != nil {
+		t.Fatalf("Remove() subscriptions blocker error = %v, want nil", err)
+	}
+	if err := store.GC(now, 7*24*time.Hour); err != nil {
+		t.Fatalf("GC() retry error = %v, want nil", err)
+	}
+	reloaded, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore() after GC retry error = %v, want nil", err)
+	}
+	if _, ok := reloaded.events["C123:700.001"]; ok {
+		t.Error("reloaded event found after GC cleanup, want none")
+	}
+	if _, ok := reloaded.GetSubscription("C123:700.002"); ok {
+		t.Error("reloaded subscription found after GC retry, want none")
 	}
 }
 

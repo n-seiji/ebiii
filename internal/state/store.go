@@ -287,7 +287,6 @@ func (s *Store) GC(now time.Time, olderThan time.Duration) error {
 	}
 	if subscriptionsChanged {
 		if err := s.saveSubscriptions(); err != nil {
-			s.events = previousEvents
 			s.subscriptions = previousSubscriptions
 			return fmt.Errorf("save subscription garbage collection: %w", err)
 		}
