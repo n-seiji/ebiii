@@ -200,6 +200,78 @@ func TestGC(t *testing.T) {
 	}
 }
 
+func TestSubscriptionLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v, want nil", err)
+	}
+
+	startedAt := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	expiresAt := startedAt.Add(24 * time.Hour)
+	if err := store.SetSubscription("C123:500.001", startedAt, expiresAt); err != nil {
+		t.Fatalf("SetSubscription() error = %v, want nil", err)
+	}
+	if got, ok := store.GetSubscription("C123:500.001"); !ok || got != (Subscription{StartedAt: startedAt, ExpiresAt: expiresAt}) {
+		t.Errorf("GetSubscription() = (%+v, %v), want (%+v, true)", got, ok, Subscription{StartedAt: startedAt, ExpiresAt: expiresAt})
+	}
+
+	renewedAt := expiresAt.Add(24 * time.Hour)
+	if err := store.SetSubscription("C123:500.001", startedAt, renewedAt); err != nil {
+		t.Fatalf("SetSubscription() renewal error = %v, want nil", err)
+	}
+
+	reloaded, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore() after subscription writes error = %v, want nil", err)
+	}
+	if got, ok := reloaded.GetSubscription("C123:500.001"); !ok || got != (Subscription{StartedAt: startedAt, ExpiresAt: renewedAt}) {
+		t.Errorf("reloaded GetSubscription() = (%+v, %v), want (%+v, true)", got, ok, Subscription{StartedAt: startedAt, ExpiresAt: renewedAt})
+	}
+
+	if err := reloaded.DeleteSubscription("C123:500.001"); err != nil {
+		t.Fatalf("DeleteSubscription() error = %v, want nil", err)
+	}
+	if _, ok := reloaded.GetSubscription("C123:500.001"); ok {
+		t.Error("GetSubscription() after DeleteSubscription() found a subscription, want none")
+	}
+}
+
+func TestGCRemovesExpiredSubscriptions(t *testing.T) {
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v, want nil", err)
+	}
+	if err := store.SetSubscription("C123:600.001", now.Add(-2*time.Hour), now.Add(-time.Second)); err != nil {
+		t.Fatalf("SetSubscription() expired error = %v, want nil", err)
+	}
+	if err := store.SetSubscription("C123:600.002", now.Add(-time.Hour), now); err != nil {
+		t.Fatalf("SetSubscription() boundary error = %v, want nil", err)
+	}
+	if err := store.SetSubscription("C123:600.003", now, now.Add(time.Hour)); err != nil {
+		t.Fatalf("SetSubscription() active error = %v, want nil", err)
+	}
+
+	if err := store.GC(now, 7*24*time.Hour); err != nil {
+		t.Fatalf("GC() error = %v, want nil", err)
+	}
+
+	reloaded, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore() after GC error = %v, want nil", err)
+	}
+	if _, ok := reloaded.GetSubscription("C123:600.001"); ok {
+		t.Error("GC() retained expired subscription, want removed")
+	}
+	for _, key := range []string{"C123:600.002", "C123:600.003"} {
+		if _, ok := reloaded.GetSubscription(key); !ok {
+			t.Errorf("GC() removed active subscription %q, want retained", key)
+		}
+	}
+}
+
 func TestNewStoreRejectsCorruptJSON(t *testing.T) {
 	tests := []struct {
 		name     string

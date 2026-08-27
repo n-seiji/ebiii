@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	sessionsFilename = "sessions.json"
-	eventsFilename   = "events.json"
+	sessionsFilename      = "sessions.json"
+	eventsFilename        = "events.json"
+	subscriptionsFilename = "subscriptions.json"
 )
 
 // State is the processing state of a Slack mention event.
@@ -42,7 +43,13 @@ type event struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// Store persists thread sessions and event states in separate JSON files.
+// Subscription is an expiring subscription for a Slack thread.
+type Subscription struct {
+	StartedAt time.Time `json:"started_at"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// Store persists thread sessions, event states, and subscriptions in separate JSON files.
 type Store struct {
 	dir string
 
@@ -51,6 +58,9 @@ type Store struct {
 
 	eventsMu sync.Mutex
 	events   map[string]event
+
+	subscriptionsMu sync.Mutex
+	subscriptions   map[string]Subscription
 }
 
 // NewStore loads or creates a state store rooted at dir.
@@ -78,11 +88,19 @@ func NewStore(dir string) (*Store, error) {
 			return nil, fmt.Errorf("load events: %w", fmt.Errorf("event %q has invalid state %q", key, entry.State))
 		}
 	}
+	subscriptions := make(map[string]Subscription)
+	if err := loadJSON(filepath.Join(dir, subscriptionsFilename), &subscriptions); err != nil {
+		return nil, fmt.Errorf("load subscriptions: %w", err)
+	}
+	if subscriptions == nil {
+		subscriptions = make(map[string]Subscription)
+	}
 
 	return &Store{
-		dir:      dir,
-		sessions: sessions,
-		events:   events,
+		dir:           dir,
+		sessions:      sessions,
+		events:        events,
+		subscriptions: subscriptions,
 	}, nil
 }
 
@@ -109,6 +127,50 @@ func (s *Store) SetThread(threadKey string, threadID string) error {
 			delete(s.sessions, threadKey)
 		}
 		return fmt.Errorf("save thread %q: %w", threadKey, err)
+	}
+	return nil
+}
+
+// GetSubscription returns the expiring subscription associated with threadKey.
+func (s *Store) GetSubscription(threadKey string) (Subscription, bool) {
+	s.subscriptionsMu.Lock()
+	defer s.subscriptionsMu.Unlock()
+
+	subscription, ok := s.subscriptions[threadKey]
+	return subscription, ok
+}
+
+// SetSubscription associates threadKey with an expiring subscription.
+func (s *Store) SetSubscription(threadKey string, startedAt, expiresAt time.Time) error {
+	s.subscriptionsMu.Lock()
+	defer s.subscriptionsMu.Unlock()
+
+	previous, existed := s.subscriptions[threadKey]
+	s.subscriptions[threadKey] = Subscription{StartedAt: startedAt, ExpiresAt: expiresAt}
+	if err := s.saveSubscriptions(); err != nil {
+		if existed {
+			s.subscriptions[threadKey] = previous
+		} else {
+			delete(s.subscriptions, threadKey)
+		}
+		return fmt.Errorf("save subscription %q: %w", threadKey, err)
+	}
+	return nil
+}
+
+// DeleteSubscription removes the subscription associated with threadKey.
+func (s *Store) DeleteSubscription(threadKey string) error {
+	s.subscriptionsMu.Lock()
+	defer s.subscriptionsMu.Unlock()
+
+	previous, existed := s.subscriptions[threadKey]
+	if !existed {
+		return nil
+	}
+	delete(s.subscriptions, threadKey)
+	if err := s.saveSubscriptions(); err != nil {
+		s.subscriptions[threadKey] = previous
+		return fmt.Errorf("delete subscription %q: %w", threadKey, err)
 	}
 	return nil
 }
@@ -189,26 +251,46 @@ func (s *Store) RecoverStartup() error {
 	return nil
 }
 
-// GC removes terminal events older than the supplied retention duration.
+// GC removes terminal events older than the supplied retention duration and expired subscriptions.
 func (s *Store) GC(now time.Time, olderThan time.Duration) error {
 	s.eventsMu.Lock()
 	defer s.eventsMu.Unlock()
+	s.subscriptionsMu.Lock()
+	defer s.subscriptionsMu.Unlock()
 
-	previous := cloneEvents(s.events)
+	previousEvents := cloneEvents(s.events)
+	previousSubscriptions := cloneSubscriptions(s.subscriptions)
 	cutoff := now.Add(-olderThan)
-	changed := false
+	eventsChanged := false
 	for key, entry := range s.events {
 		if terminal(entry.State) && entry.UpdatedAt.Before(cutoff) {
 			delete(s.events, key)
-			changed = true
+			eventsChanged = true
 		}
 	}
-	if !changed {
+	subscriptionsChanged := false
+	for key, subscription := range s.subscriptions {
+		if subscription.ExpiresAt.Before(now) {
+			delete(s.subscriptions, key)
+			subscriptionsChanged = true
+		}
+	}
+	if !eventsChanged && !subscriptionsChanged {
 		return nil
 	}
-	if err := s.saveEvents(); err != nil {
-		s.events = previous
-		return fmt.Errorf("save event garbage collection: %w", err)
+	if eventsChanged {
+		if err := s.saveEvents(); err != nil {
+			s.events = previousEvents
+			s.subscriptions = previousSubscriptions
+			return fmt.Errorf("save event garbage collection: %w", err)
+		}
+	}
+	if subscriptionsChanged {
+		if err := s.saveSubscriptions(); err != nil {
+			s.events = previousEvents
+			s.subscriptions = previousSubscriptions
+			return fmt.Errorf("save subscription garbage collection: %w", err)
+		}
 	}
 	return nil
 }
@@ -223,6 +305,13 @@ func (s *Store) saveSessions() error {
 func (s *Store) saveEvents() error {
 	if err := atomicWriteJSON(filepath.Join(s.dir, eventsFilename), s.events); err != nil {
 		return fmt.Errorf("write events: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) saveSubscriptions() error {
+	if err := atomicWriteJSON(filepath.Join(s.dir, subscriptionsFilename), s.subscriptions); err != nil {
+		return fmt.Errorf("write subscriptions: %w", err)
 	}
 	return nil
 }
@@ -305,6 +394,12 @@ func terminal(state State) bool {
 
 func cloneEvents(source map[string]event) map[string]event {
 	cloned := make(map[string]event, len(source))
+	maps.Copy(cloned, source)
+	return cloned
+}
+
+func cloneSubscriptions(source map[string]Subscription) map[string]Subscription {
+	cloned := make(map[string]Subscription, len(source))
 	maps.Copy(cloned, source)
 	return cloned
 }
