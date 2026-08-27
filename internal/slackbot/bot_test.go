@@ -22,17 +22,18 @@ import (
 )
 
 type fakeStore struct {
-	mu                sync.Mutex
-	claim             bool
-	claimErr          error
-	claimCalls        int
-	current           state.State
-	transitions       [][2]state.State
-	threadIDs         map[string]string
-	threadKeys        []string
-	subscriptions     map[string]state.Subscription
-	subscriptionCalls []subscriptionCall
-	subscriptionErr   error
+	mu                  sync.Mutex
+	claim               bool
+	claimErr            error
+	claimCalls          int
+	current             state.State
+	transitions         [][2]state.State
+	threadIDs           map[string]string
+	threadKeys          []string
+	subscriptions       map[string]state.Subscription
+	subscriptionCalls   []subscriptionCall
+	subscriptionDeletes []string
+	subscriptionErr     error
 }
 
 type subscriptionCall struct {
@@ -108,6 +109,7 @@ func (s *fakeStore) SetSubscription(key string, startedAt, expiresAt time.Time) 
 func (s *fakeStore) DeleteSubscription(key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.subscriptionDeletes = append(s.subscriptionDeletes, key)
 	delete(s.subscriptions, key)
 	return nil
 }
@@ -248,6 +250,30 @@ func mention() *slackevents.AppMentionEvent {
 		Channel:   "C1",
 		TimeStamp: "100.1",
 		Text:      "<@UBOT> do it",
+	}
+}
+
+func messageReply(user, timestamp, text string) *slackevents.MessageEvent {
+	return &slackevents.MessageEvent{
+		Type:            "message",
+		User:            user,
+		Text:            text,
+		ThreadTimeStamp: "100.1",
+		TimeStamp:       timestamp,
+		Channel:         "C1",
+		ChannelType:     "channel",
+	}
+}
+
+func configureActiveSubscription(bot *Bot, store *fakeStore, now time.Time) {
+	bot.allowedChannels = makeSet([]string{"C1"})
+	bot.now = func() time.Time { return now }
+	if store.subscriptions == nil {
+		store.subscriptions = make(map[string]state.Subscription)
+	}
+	store.subscriptions["C1:100.1"] = state.Subscription{
+		StartedAt: now.Add(-time.Hour),
+		ExpiresAt: now.Add(time.Hour),
 	}
 }
 
@@ -622,6 +648,203 @@ func TestWebAPIHasReactionUsesReactionsGet(t *testing.T) {
 	}
 	if marked {
 		t.Fatal("HasReaction() for absent reaction = true, want false")
+	}
+}
+
+func TestAllowedActiveMessageReplyRunsPlanningInSharedThreadSession(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{}
+	runner := successfulPlanRunner()
+	bot := newTestBot(t, store, api, runner)
+	configureActiveSubscription(bot, store, now)
+
+	bot.HandleMessage(context.Background(), messageReply("U2", "200.2", "please continue"))
+
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	if got := store.threadKeys; !reflect.DeepEqual(got, []string{"v3:C1:100.1"}) {
+		t.Fatalf("thread keys = %v, want v3 channel/thread session", got)
+	}
+	if len(runner.prompts) != 1 {
+		t.Fatalf("runner prompts = %d, want 1", len(runner.prompts))
+	}
+	for _, want := range []string{
+		"<authenticated_slack_author_id>\nU2\n</authenticated_slack_author_id>",
+		"<message_text>\nplease continue\n</message_text>",
+		"## 方針",
+		"## 作業指示",
+	} {
+		if !strings.Contains(runner.prompts[0], want) {
+			t.Errorf("message plan prompt does not contain %q", want)
+		}
+	}
+	if api.reactionCalls != 0 {
+		t.Fatalf("message reply reaction lookups = %d, want 0", api.reactionCalls)
+	}
+	if len(store.subscriptionCalls) != 0 {
+		t.Fatalf("message reply renewed subscription: %v", store.subscriptionCalls)
+	}
+	wantSubscription := state.Subscription{StartedAt: now.Add(-time.Hour), ExpiresAt: now.Add(time.Hour)}
+	if got, ok := store.GetSubscription("C1:100.1"); !ok || got != wantSubscription {
+		t.Fatalf("subscription after reply = (%+v, %v), want unchanged (%+v, true)", got, ok, wantSubscription)
+	}
+}
+
+func TestMessageRepliesFromMultipleAuthorsShareOneSession(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	store := &fakeStore{claim: true}
+	runner := &fakeRunner{responses: append(
+		successfulPlanRunner().responses,
+		successfulPlanRunner().responses...,
+	)}
+	bot := newTestBot(t, store, &fakeSlack{}, runner)
+	configureActiveSubscription(bot, store, now)
+
+	bot.HandleMessage(context.Background(), messageReply("U2", "200.2", "first reply"))
+	bot.HandleMessage(context.Background(), messageReply("U3", "300.3", "second reply"))
+
+	if got := store.threadKeys; !reflect.DeepEqual(got, []string{"v3:C1:100.1", "v3:C1:100.1"}) {
+		t.Fatalf("thread keys = %v, want one shared Slack thread key", got)
+	}
+	if got := runner.threadIDs; !reflect.DeepEqual(got, []string{"", "plan-thread"}) {
+		t.Fatalf("runner thread IDs = %v, want second author to resume first author's session", got)
+	}
+	if len(runner.prompts) != 2 ||
+		!strings.Contains(runner.prompts[0], "<authenticated_slack_author_id>\nU2\n") ||
+		!strings.Contains(runner.prompts[1], "<authenticated_slack_author_id>\nU3\n") {
+		t.Fatalf("prompts do not preserve authenticated authors: %q", runner.prompts)
+	}
+}
+
+func TestMessageReplyCheapFiltersSkipProcessing(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*Bot, *fakeStore)
+		event     *slackevents.MessageEvent
+	}{
+		{
+			name: "disallowed channel",
+			configure: func(_ *Bot, store *fakeStore) {
+				store.subscriptions["C2:100.1"] = state.Subscription{ExpiresAt: time.Now().Add(time.Hour)}
+			},
+			event: func() *slackevents.MessageEvent {
+				event := messageReply("U2", "200.2", "ignored")
+				event.Channel = "C2"
+				return event
+			}(),
+		},
+		{name: "root message", event: func() *slackevents.MessageEvent {
+			event := messageReply("U2", "200.2", "ignored")
+			event.ThreadTimeStamp = ""
+			return event
+		}()},
+		{
+			name: "bot subtype",
+			event: func() *slackevents.MessageEvent {
+				event := messageReply("UBOT2", "200.2", "ignored")
+				event.SubType = "bot_message"
+				event.BotID = "B2"
+				return event
+			}(),
+		},
+		{name: "edit", event: func() *slackevents.MessageEvent {
+			event := messageReply("U2", "200.2", "edited")
+			event.SubType = "message_changed"
+			event.Message = &slack.Msg{Edited: &slack.Edited{User: "U2", Timestamp: "300.3"}}
+			return event
+		}()},
+		{name: "delete", event: func() *slackevents.MessageEvent {
+			event := messageReply("U2", "200.2", "deleted")
+			event.SubType = "message_deleted"
+			event.DeletedTimeStamp = "200.2"
+			return event
+		}()},
+		{name: "contains ebi mention", event: messageReply("U2", "200.2", "please <@UBOT> continue")},
+		{name: "private channel", event: func() *slackevents.MessageEvent {
+			event := messageReply("U2", "200.2", "ignored")
+			event.ChannelType = "group"
+			return event
+		}()},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{claim: true, subscriptions: map[string]state.Subscription{
+				"C1:100.1": {ExpiresAt: time.Now().Add(time.Hour)},
+			}}
+			api := &fakeSlack{hasReaction: true}
+			runner := &fakeRunner{}
+			bot := newTestBot(t, store, api, runner)
+			bot.allowedChannels = makeSet([]string{"C1"})
+			if test.configure != nil {
+				test.configure(bot, store)
+			}
+
+			bot.HandleMessage(context.Background(), test.event)
+
+			if store.claimCalls != 0 || runner.calls != 0 || len(api.calls) != 0 || api.threadCalls != 0 || api.reactionCalls != 0 {
+				t.Fatalf("ignored message caused claim=%d runner=%d Slack calls=%d thread reads=%d reaction lookups=%d",
+					store.claimCalls, runner.calls, len(api.calls), api.threadCalls, api.reactionCalls)
+			}
+		})
+	}
+}
+
+func TestMessageReplyWithoutSubscriptionIsIgnored(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{hasReaction: true}
+	runner := &fakeRunner{}
+	bot := newTestBot(t, store, api, runner)
+	bot.allowedChannels = makeSet([]string{"C1"})
+
+	bot.HandleMessage(context.Background(), messageReply("U2", "200.2", "not subscribed"))
+
+	if store.claimCalls != 0 || runner.calls != 0 || len(api.calls) != 0 || api.threadCalls != 0 || api.reactionCalls != 0 {
+		t.Fatalf("unsubscribed message caused claim=%d runner=%d Slack calls=%d thread reads=%d reaction lookups=%d",
+			store.claimCalls, runner.calls, len(api.calls), api.threadCalls, api.reactionCalls)
+	}
+}
+
+func TestExpiredMessageReplySubscriptionIsDeletedAndIgnored(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	store := &fakeStore{claim: true, subscriptions: map[string]state.Subscription{
+		"C1:100.1": {StartedAt: now.Add(-2 * time.Hour), ExpiresAt: now},
+	}}
+	api := &fakeSlack{hasReaction: true}
+	runner := &fakeRunner{}
+	bot := newTestBot(t, store, api, runner)
+	bot.allowedChannels = makeSet([]string{"C1"})
+	bot.now = func() time.Time { return now }
+
+	bot.HandleMessage(context.Background(), messageReply("U2", "200.2", "expired"))
+
+	if !reflect.DeepEqual(store.subscriptionDeletes, []string{"C1:100.1"}) {
+		t.Fatalf("subscription deletes = %v, want expired thread", store.subscriptionDeletes)
+	}
+	if _, ok := store.GetSubscription("C1:100.1"); ok {
+		t.Fatal("expired subscription still exists")
+	}
+	if store.claimCalls != 0 || runner.calls != 0 || len(api.calls) != 0 || api.threadCalls != 0 || api.reactionCalls != 0 {
+		t.Fatalf("expired message caused claim=%d runner=%d Slack calls=%d thread reads=%d reaction lookups=%d",
+			store.claimCalls, runner.calls, len(api.calls), api.threadCalls, api.reactionCalls)
+	}
+}
+
+func TestDuplicateSubscribedMessageReplyIsSkippedWithoutSlackCalls(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	store := &fakeStore{claim: false}
+	api := &fakeSlack{hasReaction: true}
+	runner := &fakeRunner{}
+	bot := newTestBot(t, store, api, runner)
+	configureActiveSubscription(bot, store, now)
+
+	bot.HandleMessage(context.Background(), messageReply("U2", "200.2", "duplicate"))
+
+	if store.claimCalls != 1 || runner.calls != 0 || len(api.calls) != 0 || api.threadCalls != 0 || api.reactionCalls != 0 {
+		t.Fatalf("duplicate message caused claim=%d runner=%d Slack calls=%d thread reads=%d reaction lookups=%d",
+			store.claimCalls, runner.calls, len(api.calls), api.threadCalls, api.reactionCalls)
 	}
 }
 

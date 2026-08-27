@@ -102,6 +102,23 @@ type Bot struct {
 	sleep           func(context.Context, time.Duration) error
 }
 
+type triggerSource uint8
+
+const (
+	mentionTrigger triggerSource = iota
+	messageTrigger
+)
+
+type processingTrigger struct {
+	source      triggerSource
+	authorID    string
+	channel     string
+	timestamp   string
+	threadTS    string
+	message     string
+	threadReply bool
+}
+
 // New constructs a Bot.
 func New(api SlackAPI, store Store, runner Runner, config Config, playbooks []playbook.Playbook) *Bot {
 	config.WritableRoots = append([]string(nil), config.WritableRoots...)
@@ -156,15 +173,75 @@ func (b *Bot) handleMention(ctx context.Context, event *slackevents.AppMentionEv
 	if message == "" {
 		return
 	}
+	b.processTrigger(ctx, processingTrigger{
+		source:      mentionTrigger,
+		authorID:    event.User,
+		channel:     event.Channel,
+		timestamp:   event.TimeStamp,
+		threadTS:    threadTS,
+		message:     message,
+		threadReply: event.ThreadTimeStamp != "",
+	})
+}
 
-	eventKey := event.Channel + ":" + event.TimeStamp
+// HandleMessage filters and processes one already-acknowledged ordinary
+// public-channel message event from an active subscribed thread.
+func (b *Bot) HandleMessage(ctx context.Context, event *slackevents.MessageEvent) {
+	if event == nil ||
+		event.ChannelType != "channel" ||
+		event.ThreadTimeStamp == "" ||
+		event.User == "" ||
+		event.User == b.config.BotUserID ||
+		event.BotID != "" ||
+		event.SubType != "" ||
+		event.IsEdited() ||
+		event.DeletedTimeStamp != "" ||
+		strings.TrimSpace(event.Text) == "" {
+		return
+	}
+	if _, ok := b.allowedChannels[event.Channel]; !ok {
+		return
+	}
+	if b.config.BotUserID != "" && strings.Contains(event.Text, "<@"+b.config.BotUserID+">") {
+		return
+	}
+
+	subscriptionKey := event.Channel + ":" + event.ThreadTimeStamp
+	subscription, ok := b.store.GetSubscription(subscriptionKey)
+	if !ok {
+		return
+	}
+	if !subscription.ExpiresAt.After(b.now()) {
+		if err := b.store.DeleteSubscription(subscriptionKey); err != nil {
+			log.Printf("slackbot: delete expired subscription %q: %v", subscriptionKey, err)
+		}
+		return
+	}
+
+	b.processTrigger(ctx, processingTrigger{
+		source:      messageTrigger,
+		authorID:    event.User,
+		channel:     event.Channel,
+		timestamp:   event.TimeStamp,
+		threadTS:    event.ThreadTimeStamp,
+		message:     event.Text,
+		threadReply: true,
+	})
+}
+
+func (b *Bot) processTrigger(ctx context.Context, trigger processingTrigger) {
+	channel := trigger.channel
+	timestamp := trigger.timestamp
+	threadTS := trigger.threadTS
+
+	eventKey := channel + ":" + timestamp
 	// v3 prevents sessions created before thread sharing from being resumed.
-	threadKey := "v3:" + event.Channel + ":" + threadTS
+	threadKey := "v3:" + channel + ":" + threadTS
 
 	claimed, err := b.store.ClaimEvent(eventKey)
 	if err != nil {
 		log.Printf("slackbot: claim %q: %v", eventKey, err)
-		if postErr := b.post(ctx, event.Channel, threadTS, claimFailureMessage); postErr != nil {
+		if postErr := b.post(ctx, channel, threadTS, claimFailureMessage); postErr != nil {
 			log.Printf("slackbot: post claim failure: %v", postErr)
 		}
 		return
@@ -172,41 +249,48 @@ func (b *Bot) handleMention(ctx context.Context, event *slackevents.AppMentionEv
 	if !claimed {
 		return
 	}
-	b.startThreadSubscription(ctx, event.Channel, threadTS)
-	b.addReaction(ctx, event.Channel, event.TimeStamp, "eyes")
+	if trigger.source == mentionTrigger {
+		b.startThreadSubscription(ctx, channel, threadTS)
+	}
+	b.addReaction(ctx, channel, timestamp, "eyes")
 
 	if err := b.store.Transition(eventKey, state.Received, state.Planning); err != nil {
 		log.Printf("slackbot: start planning %q: %v", eventKey, err)
-		if postErr := b.post(ctx, event.Channel, threadTS, planFailureMessage); postErr != nil {
+		if postErr := b.post(ctx, channel, threadTS, planFailureMessage); postErr != nil {
 			log.Printf("slackbot: post planning transition failure %q: %v", eventKey, postErr)
 		}
-		b.finalReaction(ctx, event.Channel, event.TimeStamp, false)
+		b.finalReaction(ctx, channel, timestamp, false)
 		return
 	}
-	b.setStatus(ctx, event.Channel, threadTS, planningStatus)
-	defer b.clearStatus(ctx, event.Channel, threadTS)
+	b.setStatus(ctx, channel, threadTS, planningStatus)
+	defer b.clearStatus(ctx, channel, threadTS)
 
 	lock := b.threadLock(threadKey)
 	lock.Lock()
 	threadID, hasThread := b.store.GetThread(threadKey)
 	var slackThread string
-	if !hasThread && event.ThreadTimeStamp != "" {
-		threadMessages, err := b.api.GetThreadMessages(ctx, event.Channel, threadTS, event.TimeStamp)
+	if !hasThread && trigger.threadReply {
+		threadMessages, err := b.api.GetThreadMessages(ctx, channel, threadTS, timestamp)
 		if err != nil {
 			lock.Unlock()
 			log.Printf("slackbot: read thread context %q: %v", eventKey, err)
-			b.fail(ctx, eventKey, state.Planning, state.Failed, event.Channel, threadTS, event.TimeStamp, threadFailureMessage)
+			b.fail(ctx, eventKey, state.Planning, state.Failed, channel, threadTS, timestamp, threadFailureMessage)
 			return
 		}
-		slackThread = formatThreadContext(threadMessages, event.TimeStamp)
+		slackThread = formatThreadContext(threadMessages, timestamp)
 	}
 	b.memoryMu.RLock()
-	memoryContext, memErr := memory.ReadContext(b.config.MemoryDir, event.Channel)
+	memoryContext, memErr := memory.ReadContext(b.config.MemoryDir, channel)
 	b.memoryMu.RUnlock()
 	if memErr != nil {
 		log.Printf("slackbot: read memory: %v", memErr)
 	}
-	planPrompt := prompt.BuildPlanPrompt(memoryContext, b.playbooks, slackThread, message)
+	var planPrompt string
+	if trigger.source == messageTrigger {
+		planPrompt = prompt.BuildMessagePlanPrompt(memoryContext, b.playbooks, slackThread, trigger.authorID, trigger.message)
+	} else {
+		planPrompt = prompt.BuildPlanPrompt(memoryContext, b.playbooks, slackThread, trigger.message)
+	}
 	planResult, runErr := b.runTurn(ctx, threadID, "read-only-network", b.config.WorkspaceDir, nil, planPrompt, func(id string) error {
 		if err := b.store.SetThread(threadKey, id); err != nil {
 			return fmt.Errorf("persist plan thread: %w", err)
@@ -221,11 +305,11 @@ func (b *Bot) handleMention(ctx context.Context, event *slackevents.AppMentionEv
 		} else if planResult != nil {
 			log.Printf("slackbot: plan turn %q incomplete: %s", eventKey, planResult.Err)
 		}
-		b.fail(ctx, eventKey, state.Planning, state.Failed, event.Channel, threadTS, event.TimeStamp, planFailureMessage)
+		b.fail(ctx, eventKey, state.Planning, state.Failed, channel, threadTS, timestamp, planFailureMessage)
 		return
 	}
 	if len(planResult.Messages) == 0 {
-		b.finishFailClosed(ctx, eventKey, event.Channel, threadTS, event.TimeStamp, failClosedMessage)
+		b.finishFailClosed(ctx, eventKey, channel, threadTS, timestamp, failClosedMessage)
 		return
 	}
 
@@ -233,36 +317,36 @@ func (b *Bot) handleMention(ctx context.Context, event *slackevents.AppMentionEv
 	policy, instruction, err := codex.ParsePlan(planText)
 	if err != nil {
 		log.Printf("slackbot: parse plan %q: %v", eventKey, err)
-		b.finishFailClosed(ctx, eventKey, event.Channel, threadTS, event.TimeStamp, planText+"\n\n"+failClosedMessage)
+		b.finishFailClosed(ctx, eventKey, channel, threadTS, timestamp, planText+"\n\n"+failClosedMessage)
 		return
 	}
 	if err := b.store.Transition(eventKey, state.Planning, state.PlanPosted); err != nil {
 		log.Printf("slackbot: persist posted plan %q: %v", eventKey, err)
-		b.fail(ctx, eventKey, state.Planning, state.Failed, event.Channel, threadTS, event.TimeStamp, planFailureMessage)
+		b.fail(ctx, eventKey, state.Planning, state.Failed, channel, threadTS, timestamp, planFailureMessage)
 		return
 	}
 	if instruction == "" {
-		if err := b.post(ctx, event.Channel, threadTS, policy); err != nil {
+		if err := b.post(ctx, channel, threadTS, policy); err != nil {
 			log.Printf("slackbot: post policy %q: %v", eventKey, err)
-			b.fail(ctx, eventKey, state.PlanPosted, state.Failed, event.Channel, threadTS, event.TimeStamp, planFailureMessage)
+			b.fail(ctx, eventKey, state.PlanPosted, state.Failed, channel, threadTS, timestamp, planFailureMessage)
 			return
 		}
 		if err := b.store.Transition(eventKey, state.PlanPosted, state.Done); err != nil {
 			log.Printf("slackbot: finish NONE %q: %v", eventKey, err)
-			b.fail(ctx, eventKey, state.PlanPosted, state.Failed, event.Channel, threadTS, event.TimeStamp, planFailureMessage)
+			b.fail(ctx, eventKey, state.PlanPosted, state.Failed, channel, threadTS, timestamp, planFailureMessage)
 			return
 		}
-		b.finalReaction(ctx, event.Channel, event.TimeStamp, true)
+		b.finalReaction(ctx, channel, timestamp, true)
 		return
 	}
 	if err := b.store.Transition(eventKey, state.PlanPosted, state.Working); err != nil {
 		log.Printf("slackbot: start work %q: %v", eventKey, err)
-		b.fail(ctx, eventKey, state.PlanPosted, state.Failed, event.Channel, threadTS, event.TimeStamp, planFailureMessage)
+		b.fail(ctx, eventKey, state.PlanPosted, state.Failed, channel, threadTS, timestamp, planFailureMessage)
 		return
 	}
 	// A work plan is intentionally not posted: Slack would clear the progress
 	// status when processing that reply. Refresh the status until work completes.
-	stopWorkingStatus := b.keepStatus(ctx, event.Channel, threadTS, workingStatus)
+	stopWorkingStatus := b.keepStatus(ctx, channel, threadTS, workingStatus)
 	defer stopWorkingStatus()
 
 	// workMu serializes work turns and the memory append that follows them.
@@ -273,7 +357,7 @@ func (b *Bot) handleMention(ctx context.Context, event *slackevents.AppMentionEv
 	// contract and the bot writes them.
 	b.workMu.Lock()
 	b.memoryMu.RLock()
-	workMemoryContext, memErr := memory.ReadContext(b.config.MemoryDir, event.Channel)
+	workMemoryContext, memErr := memory.ReadContext(b.config.MemoryDir, channel)
 	b.memoryMu.RUnlock()
 	if memErr != nil {
 		log.Printf("slackbot: refresh memory before work: %v", memErr)
@@ -305,7 +389,7 @@ func (b *Bot) handleMention(ctx context.Context, event *slackevents.AppMentionEv
 				continue
 			}
 			written, err := memory.AppendScoped(
-				b.config.MemoryDir, target.scope, event.Channel, target.entry,
+				b.config.MemoryDir, target.scope, channel, target.entry,
 			)
 			if err != nil {
 				log.Printf("slackbot: append %s memory %q: %v", target.scope, eventKey, err)
@@ -323,7 +407,7 @@ func (b *Bot) handleMention(ctx context.Context, event *slackevents.AppMentionEv
 		if workErr != nil {
 			log.Printf("slackbot: work turn %q: %v", eventKey, workErr)
 		}
-		b.fail(ctx, eventKey, state.Working, state.Interrupted, event.Channel, threadTS, event.TimeStamp, workFailureMessage)
+		b.fail(ctx, eventKey, state.Working, state.Interrupted, channel, threadTS, timestamp, workFailureMessage)
 		return
 	}
 	if resultText == "" {
@@ -332,17 +416,17 @@ func (b *Bot) handleMention(ctx context.Context, event *slackevents.AppMentionEv
 	if len(updatedMemoryScopes) > 0 {
 		resultText += "\n\n📝 " + strings.Join(updatedMemoryScopes, "・") + "メモリを更新しました。"
 	}
-	if err := b.post(ctx, event.Channel, threadTS, resultText); err != nil {
+	if err := b.post(ctx, channel, threadTS, resultText); err != nil {
 		log.Printf("slackbot: post work result %q: %v", eventKey, err)
-		b.fail(ctx, eventKey, state.Working, state.Interrupted, event.Channel, threadTS, event.TimeStamp, workFailureMessage)
+		b.fail(ctx, eventKey, state.Working, state.Interrupted, channel, threadTS, timestamp, workFailureMessage)
 		return
 	}
 	if err := b.store.Transition(eventKey, state.Working, state.Done); err != nil {
 		log.Printf("slackbot: finish work %q: %v", eventKey, err)
-		b.fail(ctx, eventKey, state.Working, state.Interrupted, event.Channel, threadTS, event.TimeStamp, workFailureMessage)
+		b.fail(ctx, eventKey, state.Working, state.Interrupted, channel, threadTS, timestamp, workFailureMessage)
 		return
 	}
-	b.finalReaction(ctx, event.Channel, event.TimeStamp, true)
+	b.finalReaction(ctx, channel, timestamp, true)
 }
 
 func (b *Bot) forbidden(ctx context.Context, event *slackevents.AppMentionEvent) {
@@ -662,7 +746,7 @@ func (w *webAPI) RemoveReaction(ctx context.Context, channel, timestamp, name st
 }
 
 // RunSocketMode connects a Bot to Slack Socket Mode. It acknowledges every
-// envelope before dispatching app mentions to separate goroutines.
+// envelope before dispatching app mentions and ordinary messages separately.
 func RunSocketMode(acceptCtx, turnCtx context.Context, botToken, appToken string, bot *Bot, wg *sync.WaitGroup) error {
 	client := slack.New(botToken, slack.OptionAppLevelToken(appToken))
 	auth, err := client.AuthTestContext(acceptCtx)
@@ -700,17 +784,20 @@ func RunSocketMode(acceptCtx, turnCtx context.Context, botToken, appToken string
 			if !ok {
 				continue
 			}
-			mention, ok := apiEvent.InnerEvent.Data.(*slackevents.AppMentionEvent)
-			if !ok {
-				continue
+			switch innerEvent := apiEvent.InnerEvent.Data.(type) {
+			case *slackevents.AppMentionEvent:
+				workflowID := ""
+				if event.Request != nil {
+					workflowID = workflowIDFromPayload(event.Request.Payload)
+				}
+				wg.Go(func() {
+					bot.handleMention(turnCtx, innerEvent, workflowID)
+				})
+			case *slackevents.MessageEvent:
+				wg.Go(func() {
+					bot.HandleMessage(turnCtx, innerEvent)
+				})
 			}
-			workflowID := ""
-			if event.Request != nil {
-				workflowID = workflowIDFromPayload(event.Request.Payload)
-			}
-			wg.Go(func() {
-				bot.handleMention(turnCtx, mention, workflowID)
-			})
 		}
 	}
 }
