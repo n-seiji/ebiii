@@ -175,6 +175,25 @@ func (s *Store) DeleteSubscription(threadKey string) error {
 	return nil
 }
 
+// DeleteSubscriptionIfExpired atomically removes a subscription only when its
+// current expiry is at or before now. A concurrent renewal that acquires the
+// subscription lock first is preserved.
+func (s *Store) DeleteSubscriptionIfExpired(threadKey string, now time.Time) (bool, error) {
+	s.subscriptionsMu.Lock()
+	defer s.subscriptionsMu.Unlock()
+
+	subscription, existed := s.subscriptions[threadKey]
+	if !existed || subscription.ExpiresAt.After(now) {
+		return false, nil
+	}
+	delete(s.subscriptions, threadKey)
+	if err := s.saveSubscriptions(); err != nil {
+		s.subscriptions[threadKey] = subscription
+		return false, fmt.Errorf("delete expired subscription %q: %w", threadKey, err)
+	}
+	return true, nil
+}
+
 // ClaimEvent atomically claims an unregistered or failed event.
 func (s *Store) ClaimEvent(eventKey string) (bool, error) {
 	s.eventsMu.Lock()

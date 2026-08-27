@@ -244,6 +244,86 @@ func TestSubscriptionLifecycle(t *testing.T) {
 	}
 }
 
+func TestDeleteSubscriptionIfExpired(t *testing.T) {
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name        string
+		expiresAt   *time.Time
+		wantDeleted bool
+		wantFound   bool
+	}{
+		{name: "missing", wantDeleted: false, wantFound: false},
+		{name: "active", expiresAt: timePointer(now.Add(time.Second)), wantDeleted: false, wantFound: true},
+		{name: "boundary", expiresAt: timePointer(now), wantDeleted: true, wantFound: false},
+		{name: "expired", expiresAt: timePointer(now.Add(-time.Second)), wantDeleted: true, wantFound: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			store, err := NewStore(dir)
+			if err != nil {
+				t.Fatalf("NewStore() error = %v, want nil", err)
+			}
+			const key = "C123:550.001"
+			if test.expiresAt != nil {
+				if err := store.SetSubscription(key, now.Add(-time.Hour), *test.expiresAt); err != nil {
+					t.Fatalf("SetSubscription() error = %v, want nil", err)
+				}
+			}
+
+			deleted, err := store.DeleteSubscriptionIfExpired(key, now)
+			if err != nil {
+				t.Fatalf("DeleteSubscriptionIfExpired() error = %v, want nil", err)
+			}
+			if deleted != test.wantDeleted {
+				t.Errorf("DeleteSubscriptionIfExpired() deleted = %v, want %v", deleted, test.wantDeleted)
+			}
+			_, found := store.GetSubscription(key)
+			if found != test.wantFound {
+				t.Errorf("GetSubscription() found = %v after conditional delete, want %v", found, test.wantFound)
+			}
+
+			reloaded, err := NewStore(dir)
+			if err != nil {
+				t.Fatalf("NewStore() after conditional delete error = %v, want nil", err)
+			}
+			_, found = reloaded.GetSubscription(key)
+			if found != test.wantFound {
+				t.Errorf("reloaded GetSubscription() found = %v, want %v", found, test.wantFound)
+			}
+		})
+	}
+}
+
+func TestDeleteSubscriptionIfExpiredRollsBackAfterSaveFailure(t *testing.T) {
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	store := newTestStore(t)
+	const key = "C123:550.002"
+	want := Subscription{StartedAt: now.Add(-time.Hour), ExpiresAt: now}
+	if err := store.SetSubscription(key, want.StartedAt, want.ExpiresAt); err != nil {
+		t.Fatalf("SetSubscription() error = %v, want nil", err)
+	}
+	restore := blockStateDirectory(t, store.dir)
+
+	deleted, err := store.DeleteSubscriptionIfExpired(key, now)
+	if err == nil {
+		t.Fatal("DeleteSubscriptionIfExpired() error = nil, want non-nil")
+	}
+	if deleted {
+		t.Fatal("DeleteSubscriptionIfExpired() deleted = true after save failure, want false")
+	}
+	if got, ok := store.GetSubscription(key); !ok || got != want {
+		t.Fatalf("subscription after save failure = (%+v, %v), want rollback (%+v, true)", got, ok, want)
+	}
+
+	restore()
+	deleted, err = store.DeleteSubscriptionIfExpired(key, now)
+	if err != nil || !deleted {
+		t.Fatalf("DeleteSubscriptionIfExpired() after restore = (%v, %v), want (true, nil)", deleted, err)
+	}
+}
+
 func TestGCRemovesExpiredSubscriptions(t *testing.T) {
 	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
 	dir := t.TempDir()
@@ -392,6 +472,10 @@ func newTestStore(t *testing.T) *Store {
 		t.Fatalf("NewStore() error = %v, want nil", err)
 	}
 	return store
+}
+
+func timePointer(value time.Time) *time.Time {
+	return &value
 }
 
 func mustClaim(t *testing.T, store *Store, key string) {

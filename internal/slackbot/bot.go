@@ -60,7 +60,7 @@ type Store interface {
 	SetThread(threadKey, threadID string) error
 	GetSubscription(threadKey string) (state.Subscription, bool)
 	SetSubscription(threadKey string, startedAt, expiresAt time.Time) error
-	DeleteSubscription(threadKey string) error
+	DeleteSubscriptionIfExpired(threadKey string, now time.Time) (bool, error)
 }
 
 // Runner executes one Codex turn.
@@ -193,7 +193,7 @@ func (b *Bot) HandleMessage(ctx context.Context, event *slackevents.MessageEvent
 		event.User == "" ||
 		event.User == b.config.BotUserID ||
 		event.BotID != "" ||
-		event.SubType != "" ||
+		(event.SubType != "" && event.SubType != slack.MsgSubTypeThreadBroadcast) ||
 		event.IsEdited() ||
 		event.DeletedTimeStamp != "" ||
 		strings.TrimSpace(event.Text) == "" {
@@ -207,14 +207,17 @@ func (b *Bot) HandleMessage(ctx context.Context, event *slackevents.MessageEvent
 	}
 
 	subscriptionKey := event.Channel + ":" + event.ThreadTimeStamp
-	subscription, ok := b.store.GetSubscription(subscriptionKey)
-	if !ok {
+	now := b.now()
+	deleted, err := b.store.DeleteSubscriptionIfExpired(subscriptionKey, now)
+	if err != nil {
+		log.Printf("slackbot: delete expired subscription %q: %v", subscriptionKey, err)
 		return
 	}
-	if !subscription.ExpiresAt.After(b.now()) {
-		if err := b.store.DeleteSubscription(subscriptionKey); err != nil {
-			log.Printf("slackbot: delete expired subscription %q: %v", subscriptionKey, err)
-		}
+	if deleted {
+		return
+	}
+	subscription, ok := b.store.GetSubscription(subscriptionKey)
+	if !ok || !subscription.ExpiresAt.After(now) {
 		return
 	}
 

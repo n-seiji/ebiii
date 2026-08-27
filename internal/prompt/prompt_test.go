@@ -128,6 +128,12 @@ func TestBuildMessagePlanPromptIsolatesAuthenticatedAuthorAndText(t *testing.T) 
 	if strings.Contains(got, "user_memory") {
 		t.Error("BuildMessagePlanPrompt() must omit user memory")
 	}
+	if strings.Contains(got, "<user_message>") {
+		t.Error("BuildMessagePlanPrompt() gives contradictory authority to a user_message block")
+	}
+	if !strings.Contains(got, "実行対象は後続の <slack_message> 内の依頼です") {
+		t.Error("BuildMessagePlanPrompt() does not identify slack_message as the authoritative request")
+	}
 }
 
 func TestBuildWorkPrompt(t *testing.T) {

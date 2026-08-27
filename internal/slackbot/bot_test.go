@@ -106,12 +106,16 @@ func (s *fakeStore) SetSubscription(key string, startedAt, expiresAt time.Time) 
 	return nil
 }
 
-func (s *fakeStore) DeleteSubscription(key string) error {
+func (s *fakeStore) DeleteSubscriptionIfExpired(key string, now time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	subscription, ok := s.subscriptions[key]
+	if !ok || subscription.ExpiresAt.After(now) {
+		return false, nil
+	}
 	s.subscriptionDeletes = append(s.subscriptionDeletes, key)
 	delete(s.subscriptions, key)
-	return nil
+	return true, nil
 }
 
 type slackCall struct {
@@ -692,6 +696,25 @@ func TestAllowedActiveMessageReplyRunsPlanningInSharedThreadSession(t *testing.T
 	}
 }
 
+func TestAllowedActiveHumanThreadBroadcastRunsPlanning(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	store := &fakeStore{claim: true}
+	runner := successfulPlanRunner()
+	bot := newTestBot(t, store, &fakeSlack{}, runner)
+	configureActiveSubscription(bot, store, now)
+	event := messageReply("U2", "200.2", "broadcast follow up")
+	event.SubType = slack.MsgSubTypeThreadBroadcast
+
+	bot.HandleMessage(context.Background(), event)
+
+	if runner.calls != 1 {
+		t.Fatalf("thread broadcast runner calls = %d, want 1", runner.calls)
+	}
+	if store.claimCalls != 1 {
+		t.Fatalf("thread broadcast claim calls = %d, want 1", store.claimCalls)
+	}
+}
+
 func TestMessageRepliesFromMultipleAuthorsShareOneSession(t *testing.T) {
 	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
 	store := &fakeStore{claim: true}
@@ -829,6 +852,79 @@ func TestExpiredMessageReplySubscriptionIsDeletedAndIgnored(t *testing.T) {
 	if store.claimCalls != 0 || runner.calls != 0 || len(api.calls) != 0 || api.threadCalls != 0 || api.reactionCalls != 0 {
 		t.Fatalf("expired message caused claim=%d runner=%d Slack calls=%d thread reads=%d reaction lookups=%d",
 			store.claimCalls, runner.calls, len(api.calls), api.threadCalls, api.reactionCalls)
+	}
+}
+
+type renewalInterleavingStore struct {
+	*state.Store
+	expiryCheckStarted chan struct{}
+	continueCheck      chan struct{}
+}
+
+func (s *renewalInterleavingStore) DeleteSubscriptionIfExpired(key string, now time.Time) (bool, error) {
+	close(s.expiryCheckStarted)
+	<-s.continueCheck
+	return s.Store.DeleteSubscriptionIfExpired(key, now)
+}
+
+func TestMessageReplyExpiryCheckDoesNotDeleteConcurrentRenewal(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	stateStore, err := state.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore() error = %v, want nil", err)
+	}
+	const subscriptionKey = "C1:100.1"
+	if err := stateStore.SetSubscription(subscriptionKey, now.Add(-2*time.Hour), now); err != nil {
+		t.Fatalf("SetSubscription() expired setup error = %v, want nil", err)
+	}
+	store := &renewalInterleavingStore{
+		Store:              stateStore,
+		expiryCheckStarted: make(chan struct{}),
+		continueCheck:      make(chan struct{}),
+	}
+	defer func() {
+		select {
+		case <-store.continueCheck:
+		default:
+			close(store.continueCheck)
+		}
+	}()
+	runner := successfulPlanRunner()
+	bot := New(&fakeSlack{}, store, runner, Config{
+		AllowedChannelIDs: []string{"C1"},
+		WorkspaceDir:      "/repo/workspace",
+		MemoryDir:         filepath.Join(t.TempDir(), "memory"),
+		CodexTimeout:      time.Minute,
+		BotUserID:         "UBOT",
+	}, nil)
+	bot.now = func() time.Time { return now }
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		bot.HandleMessage(context.Background(), messageReply("U2", "200.2", "renewed reply"))
+	}()
+	select {
+	case <-store.expiryCheckStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("message handler did not enter atomic expiry check")
+	}
+	renewed := state.Subscription{StartedAt: now, ExpiresAt: now.Add(time.Hour)}
+	if err := stateStore.SetSubscription(subscriptionKey, renewed.StartedAt, renewed.ExpiresAt); err != nil {
+		t.Fatalf("SetSubscription() renewal error = %v, want nil", err)
+	}
+	close(store.continueCheck)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("message handler did not finish after concurrent renewal")
+	}
+
+	if got, ok := stateStore.GetSubscription(subscriptionKey); !ok || got != renewed {
+		t.Fatalf("subscription after interleaved renewal = (%+v, %v), want (%+v, true)", got, ok, renewed)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls after renewal = %d, want 1 for now-active subscription", runner.calls)
 	}
 }
 
@@ -1314,7 +1410,9 @@ func (s *looseStore) GetSubscription(string) (state.Subscription, bool) {
 
 func (s *looseStore) SetSubscription(string, time.Time, time.Time) error { return nil }
 
-func (s *looseStore) DeleteSubscription(string) error { return nil }
+func (s *looseStore) DeleteSubscriptionIfExpired(string, time.Time) (bool, error) {
+	return false, nil
+}
 
 // gatedRunner holds the work turn open until release is closed so a test can
 // observe what other turns may run concurrently.
