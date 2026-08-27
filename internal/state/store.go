@@ -289,7 +289,7 @@ func (s *Store) GC(now time.Time, olderThan time.Duration) error {
 	}
 	subscriptionsChanged := false
 	for key, subscription := range s.subscriptions {
-		if subscription.ExpiresAt.Before(now) {
+		if !subscription.ExpiresAt.After(now) {
 			delete(s.subscriptions, key)
 			subscriptionsChanged = true
 		}

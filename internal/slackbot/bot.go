@@ -316,7 +316,7 @@ func (b *Bot) processTrigger(ctx context.Context, trigger processingTrigger) {
 		return
 	}
 
-	planText := planResult.Messages[len(planResult.Messages)-1]
+	planText := codex.SanitizeSlackOutput(planResult.Messages[len(planResult.Messages)-1])
 	policy, instruction, err := codex.ParsePlan(planText)
 	if err != nil {
 		log.Printf("slackbot: parse plan %q: %v", eventKey, err)
@@ -372,6 +372,7 @@ func (b *Bot) processTrigger(ctx context.Context, trigger processingTrigger) {
 	if workErr == nil && workResult != nil && workResult.Completed && len(workResult.Messages) > 0 {
 		var memoryOutputValid bool
 		resultText, memoryAppends, memoryOutputValid = codex.SplitMemoryAppends(workResult.Messages[len(workResult.Messages)-1])
+		resultText = codex.SanitizeSlackOutput(resultText)
 		if !memoryOutputValid {
 			log.Printf("slackbot: ignore malformed scoped memory output %q", eventKey)
 		}
@@ -475,7 +476,12 @@ func (b *Bot) startThreadSubscription(ctx context.Context, channel, threadTS str
 	if marker == "" {
 		return
 	}
-	marked, err := b.api.HasReaction(ctx, channel, threadTS, marker)
+	var marked bool
+	err := b.retrySlack(ctx, func() error {
+		var err error
+		marked, err = b.api.HasReaction(ctx, channel, threadTS, marker)
+		return err
+	})
 	if err != nil {
 		log.Printf("slackbot: read subscription marker %q: %v", channel+":"+threadTS, err)
 		return
@@ -578,21 +584,27 @@ func (b *Bot) clearStatus(ctx context.Context, channel, threadTS string) {
 
 func (b *Bot) post(ctx context.Context, channel, threadTS, text string) error {
 	for _, chunk := range splitMessage(text, maxSlackMessageRunes) {
-		if _, err := b.api.PostMessage(ctx, channel, threadTS, chunk); err != nil {
-			if !retryable(err) {
-				return fmt.Errorf("post Slack message: %w", err)
-			}
-			if rateLimited, ok := errors.AsType[*slack.RateLimitedError](err); ok {
-				if err := b.sleep(ctx, rateLimited.RetryAfter); err != nil {
-					return fmt.Errorf("wait for Slack retry: %w", err)
-				}
-			}
-			if _, retryErr := b.api.PostMessage(ctx, channel, threadTS, chunk); retryErr != nil {
-				return fmt.Errorf("retry Slack message: %w", retryErr)
-			}
+		if err := b.retrySlack(ctx, func() error {
+			_, err := b.api.PostMessage(ctx, channel, threadTS, chunk)
+			return err
+		}); err != nil {
+			return fmt.Errorf("post Slack message: %w", err)
 		}
 	}
 	return nil
+}
+
+func (b *Bot) retrySlack(ctx context.Context, operation func() error) error {
+	err := operation()
+	if err == nil || !retryable(err) {
+		return err
+	}
+	if rateLimited, ok := errors.AsType[*slack.RateLimitedError](err); ok {
+		if err := b.sleep(ctx, rateLimited.RetryAfter); err != nil {
+			return fmt.Errorf("wait for Slack retry: %w", err)
+		}
+	}
+	return operation()
 }
 
 func (b *Bot) threadLock(key string) *sync.Mutex {

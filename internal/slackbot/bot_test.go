@@ -140,6 +140,7 @@ type fakeSlack struct {
 	threadLatest      string
 	hasReaction       bool
 	reactionErr       error
+	reactionErrs      []error
 	reactionCalls     int
 	reactionChannel   string
 	reactionTimestamp string
@@ -195,6 +196,11 @@ func (s *fakeSlack) HasReaction(_ context.Context, channel, timestamp, reaction 
 	s.reactionChannel = channel
 	s.reactionTimestamp = timestamp
 	s.reactionName = reaction
+	if len(s.reactionErrs) > 0 {
+		err := s.reactionErrs[0]
+		s.reactionErrs = s.reactionErrs[1:]
+		return s.hasReaction, err
+	}
 	return s.hasReaction, s.reactionErr
 }
 
@@ -573,6 +579,106 @@ func TestSubscriptionStartFailuresDoNotBlockMentionTurn(t *testing.T) {
 				t.Fatalf("runner calls = %d, state = %q, want normal completed mention turn", runner.calls, store.current)
 			}
 		})
+	}
+}
+
+func TestSubscriptionMarkerLookupRetriesTransientSlackErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		firstError error
+		wantWait   time.Duration
+	}{
+		{
+			name:       "rate limit honors Retry-After",
+			firstError: &slack.RateLimitedError{RetryAfter: 3 * time.Second},
+			wantWait:   3 * time.Second,
+		},
+		{
+			name:       "server error retries immediately",
+			firstError: slack.StatusCodeError{Code: http.StatusServiceUnavailable, Status: http.StatusText(http.StatusServiceUnavailable)},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{claim: true}
+			api := &fakeSlack{hasReaction: true, reactionErrs: []error{test.firstError, nil}}
+			runner := successfulPlanRunner()
+			bot := newTestBot(t, store, api, runner)
+			bot.config.ThreadSubscriptionReaction = "thread-subete"
+			bot.config.ThreadSubscriptionTTL = 48 * time.Hour
+			var waits []time.Duration
+			bot.sleep = func(_ context.Context, duration time.Duration) error {
+				waits = append(waits, duration)
+				return nil
+			}
+
+			bot.HandleMention(context.Background(), mention())
+
+			if api.reactionCalls != 2 {
+				t.Fatalf("reaction lookup calls = %d, want 2", api.reactionCalls)
+			}
+			if len(store.subscriptionCalls) != 1 {
+				t.Fatalf("subscription saves = %d, want 1 after successful retry", len(store.subscriptionCalls))
+			}
+			var wantWaits []time.Duration
+			if test.wantWait != 0 {
+				wantWaits = []time.Duration{test.wantWait}
+			}
+			if !reflect.DeepEqual(waits, wantWaits) {
+				t.Fatalf("retry waits = %v, want %v", waits, wantWaits)
+			}
+			if runner.calls != 1 || store.current != state.Done {
+				t.Fatalf("runner calls = %d, state = %q, want completed mention", runner.calls, store.current)
+			}
+		})
+	}
+}
+
+func TestSubscriptionMarkerLookupSecondFailureSkipsSubscriptionAndContinuesMention(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{hasReaction: true, reactionErrs: []error{
+		slack.StatusCodeError{Code: http.StatusBadGateway, Status: http.StatusText(http.StatusBadGateway)},
+		slack.StatusCodeError{Code: http.StatusServiceUnavailable, Status: http.StatusText(http.StatusServiceUnavailable)},
+	}}
+	runner := successfulPlanRunner()
+	bot := newTestBot(t, store, api, runner)
+	bot.config.ThreadSubscriptionReaction = "thread-subete"
+	bot.config.ThreadSubscriptionTTL = 48 * time.Hour
+
+	bot.HandleMention(context.Background(), mention())
+
+	if api.reactionCalls != 2 {
+		t.Fatalf("reaction lookup calls = %d, want one retry", api.reactionCalls)
+	}
+	if len(store.subscriptionCalls) != 0 {
+		t.Fatalf("subscription saves = %v, want none after final lookup failure", store.subscriptionCalls)
+	}
+	if runner.calls != 1 || store.current != state.Done {
+		t.Fatalf("runner calls = %d, state = %q, want fail-open completed mention", runner.calls, store.current)
+	}
+}
+
+func TestSubscriptionMarkerLookupDoesNotRetryPermanent4xx(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{hasReaction: true, reactionErrs: []error{
+		slack.StatusCodeError{Code: http.StatusBadRequest, Status: http.StatusText(http.StatusBadRequest)},
+	}}
+	runner := successfulPlanRunner()
+	bot := newTestBot(t, store, api, runner)
+	bot.config.ThreadSubscriptionReaction = "thread-subete"
+	bot.config.ThreadSubscriptionTTL = 48 * time.Hour
+
+	bot.HandleMention(context.Background(), mention())
+
+	if api.reactionCalls != 1 {
+		t.Fatalf("reaction lookup calls = %d, want no retry", api.reactionCalls)
+	}
+	if len(store.subscriptionCalls) != 0 {
+		t.Fatalf("subscription saves = %v, want none after permanent lookup failure", store.subscriptionCalls)
+	}
+	if runner.calls != 1 || store.current != state.Done {
+		t.Fatalf("runner calls = %d, state = %q, want fail-open completed mention", runner.calls, store.current)
 	}
 }
 
@@ -985,6 +1091,118 @@ func TestFailClosedTransitionsToDoneWithCheckmark(t *testing.T) {
 				t.Errorf("posts %q do not contain %q", api.postTexts, test.want)
 			}
 			assertFinalReactionOrder(t, api.calls, "white_check_mark")
+		})
+	}
+}
+
+func TestPlanSlackOutputsSanitizeForbiddenUserMemory(t *testing.T) {
+	tests := []struct {
+		name     string
+		planText string
+		want     string
+	}{
+		{
+			name:     "successful NONE policy",
+			planText: "## 方針\nNo work needed.\n## 作業指示\nNONE\n## ユーザーメモリ追記\nprivate plan memory",
+			want:     "No work needed.",
+		},
+		{
+			name:     "parse fail-closed",
+			planText: "unstructured plan ``` ## ユーザーメモリ追記 private plan memory",
+			want:     "unstructured plan ```",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{claim: true}
+			api := &fakeSlack{}
+			runner := &fakeRunner{responses: []runnerResponse{
+				{result: &codex.TurnResult{
+					Completed: true,
+					Messages:  []string{test.planText},
+				}},
+				{result: &codex.TurnResult{Completed: true, Messages: []string{"Work completed."}}},
+			}}
+
+			newTestBot(t, store, api, runner).HandleMention(context.Background(), mention())
+
+			posts := strings.Join(api.postTexts, "|")
+			if !strings.Contains(posts, test.want) {
+				t.Fatalf("posts = %q, want preserved output %q", posts, test.want)
+			}
+			for _, forbidden := range []string{"## ユーザーメモリ追記", "private plan memory"} {
+				if strings.Contains(posts, forbidden) {
+					t.Fatalf("posts = %q, must not expose %q", posts, forbidden)
+				}
+			}
+		})
+	}
+}
+
+func TestNormalPlanSanitizesForbiddenUserMemoryBeforeWork(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{}
+	runner := &fakeRunner{responses: []runnerResponse{
+		{result: &codex.TurnResult{Completed: true, Messages: []string{
+			"## 方針\nImplement safely.\n## 作業指示\nMake the change. ## ユーザーメモリ追記 private plan memory",
+		}}},
+		{result: &codex.TurnResult{Completed: true, Messages: []string{"Work completed."}}},
+	}}
+
+	newTestBot(t, store, api, runner).HandleMention(context.Background(), mention())
+
+	if runner.calls != 2 {
+		t.Fatalf("runner calls = %d, want plan and work", runner.calls)
+	}
+	workPrompt := runner.prompts[1]
+	if !strings.Contains(workPrompt, "Make the change.") {
+		t.Fatalf("work prompt = %q, want preserved instruction", workPrompt)
+	}
+	for _, forbidden := range []string{"## ユーザーメモリ追記", "private plan memory"} {
+		if strings.Contains(workPrompt, forbidden) || strings.Contains(strings.Join(api.postTexts, "|"), forbidden) {
+			t.Fatalf("normal plan leaked %q into work or Slack output", forbidden)
+		}
+	}
+}
+
+func TestWorkSlackOutputSanitizesForbiddenUserMemoryAnywhere(t *testing.T) {
+	tests := []struct {
+		name     string
+		workText string
+	}{
+		{
+			name:     "inside fence",
+			workText: "Work completed.\n```text\n## ユーザーメモリ追記\nprivate work memory\n```",
+		},
+		{
+			name:     "inline",
+			workText: "Work completed. ## ユーザーメモリ追記 private work memory",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{claim: true}
+			api := &fakeSlack{}
+			runner := &fakeRunner{responses: []runnerResponse{
+				{result: &codex.TurnResult{Completed: true, Messages: []string{
+					"## 方針\nDo work.\n## 作業指示\nMake a change.",
+				}}},
+				{result: &codex.TurnResult{Completed: true, Messages: []string{test.workText}}},
+			}}
+
+			newTestBot(t, store, api, runner).HandleMention(context.Background(), mention())
+
+			posts := strings.Join(api.postTexts, "|")
+			if !strings.Contains(posts, "Work completed.") {
+				t.Fatalf("posts = %q, want preserved normal work output", posts)
+			}
+			for _, forbidden := range []string{"## ユーザーメモリ追記", "private work memory"} {
+				if strings.Contains(posts, forbidden) {
+					t.Fatalf("posts = %q, must not expose %q", posts, forbidden)
+				}
+			}
 		})
 	}
 }

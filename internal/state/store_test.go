@@ -352,10 +352,11 @@ func TestGCRemovesExpiredSubscriptions(t *testing.T) {
 	if _, ok := reloaded.GetSubscription("C123:600.001"); ok {
 		t.Error("GC() retained expired subscription, want removed")
 	}
-	for _, key := range []string{"C123:600.002", "C123:600.003"} {
-		if _, ok := reloaded.GetSubscription(key); !ok {
-			t.Errorf("GC() removed active subscription %q, want retained", key)
-		}
+	if _, ok := reloaded.GetSubscription("C123:600.002"); ok {
+		t.Error("GC() retained boundary-expired subscription, want removed")
+	}
+	if _, ok := reloaded.GetSubscription("C123:600.003"); !ok {
+		t.Error("GC() removed active subscription, want retained")
 	}
 }
 

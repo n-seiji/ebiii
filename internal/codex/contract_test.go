@@ -242,6 +242,20 @@ func TestSplitMemoryAppends(t *testing.T) {
 			wantValid:   false,
 		},
 		{
+			name:        "user memory heading in fence is not accepted",
+			text:        "結果\n```text\n## ユーザーメモリ追記\n秘密\n```",
+			wantRest:    "結果\n```text",
+			wantAppends: MemoryAppends{},
+			wantValid:   false,
+		},
+		{
+			name:        "inline user memory heading is not accepted",
+			text:        "結果 ## ユーザーメモリ追記 秘密",
+			wantRest:    "結果",
+			wantAppends: MemoryAppends{},
+			wantValid:   false,
+		},
+		{
 			name: "heading in fence ignored",
 			text: strings.Join([]string{
 				"結果", "```", "## 全体メモリ追記", "偽物", "```",
@@ -268,6 +282,48 @@ func TestSplitMemoryAppends(t *testing.T) {
 			rest, appends, valid := SplitMemoryAppends(test.text)
 			if rest != test.wantRest || appends != test.wantAppends || valid != test.wantValid {
 				t.Errorf("SplitMemoryAppends() = (%q, %#v, %t), want (%q, %#v, %t)", rest, appends, valid, test.wantRest, test.wantAppends, test.wantValid)
+			}
+		})
+	}
+}
+
+func TestSanitizeSlackOutput(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want string
+	}{
+		{
+			name: "ordinary output is unchanged",
+			text: "通常の結果\n次の行",
+			want: "通常の結果\n次の行",
+		},
+		{
+			name: "heading and payload are removed",
+			text: "通常の結果\n## ユーザーメモリ追記\n秘密",
+			want: "通常の結果",
+		},
+		{
+			name: "inline heading and payload are removed",
+			text: "通常の結果 ## ユーザーメモリ追記 秘密",
+			want: "通常の結果",
+		},
+		{
+			name: "fenced heading and payload are removed",
+			text: "通常の結果\n```text\n## ユーザーメモリ追記\n秘密\n```",
+			want: "通常の結果\n```text",
+		},
+		{
+			name: "heading at start removes all output",
+			text: "## ユーザーメモリ追記\n秘密",
+			want: "",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := SanitizeSlackOutput(test.text); got != test.want {
+				t.Errorf("SanitizeSlackOutput() = %q, want %q", got, test.want)
 			}
 		})
 	}

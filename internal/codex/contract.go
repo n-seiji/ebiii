@@ -72,11 +72,26 @@ func ParsePlan(text string) (string, string, error) {
 	return policy, instruction, nil
 }
 
+// SanitizeSlackOutput removes the retired user-memory section and everything
+// after it wherever the exact heading appears in model output. Truncating at
+// the first occurrence prevents fenced, inline, and malformed variants from
+// exposing the following private payload while preserving prior output.
+func SanitizeSlackOutput(text string) string {
+	index := strings.Index(text, forbiddenUserMemoryHeading)
+	if index < 0 {
+		return text
+	}
+	return strings.TrimSpace(text[:index])
+}
+
 // SplitMemoryAppends separates optional trailing scoped memory sections from
 // a work response. Sections must occur at most once and in global, channel
 // order. The legacy generic heading is treated as global memory. Ambiguous
 // output causes no memory writes and is stripped from the visible result.
 func SplitMemoryAppends(text string) (rest string, appends MemoryAppends, valid bool) {
+	if strings.Contains(text, forbiddenUserMemoryHeading) {
+		return SanitizeSlackOutput(text), MemoryAppends{}, false
+	}
 	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
 	type section struct {
 		index int
@@ -84,7 +99,6 @@ func SplitMemoryAppends(text string) (rest string, appends MemoryAppends, valid 
 	}
 	var sections []section
 	firstMemoryIndex := -1
-	hasForbiddenUserMemory := false
 	inFence := false
 	var fence byte
 	var fenceLen int
@@ -104,13 +118,6 @@ func SplitMemoryAppends(text string) (rest string, appends MemoryAppends, valid 
 		if inFence {
 			continue
 		}
-		if trimmed == forbiddenUserMemoryHeading {
-			if firstMemoryIndex == -1 {
-				firstMemoryIndex = i
-			}
-			hasForbiddenUserMemory = true
-			continue
-		}
 		scope := -1
 		switch trimmed {
 		case memoryHeading, globalMemoryHeading:
@@ -126,9 +133,6 @@ func SplitMemoryAppends(text string) (rest string, appends MemoryAppends, valid 
 		}
 	}
 
-	if hasForbiddenUserMemory {
-		return strings.TrimSpace(strings.Join(lines[:firstMemoryIndex], "\n")), MemoryAppends{}, false
-	}
 	if len(sections) == 0 {
 		return text, MemoryAppends{}, true
 	}
