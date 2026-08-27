@@ -48,6 +48,8 @@ func main() {
 	bot := slackbot.New(nil, store, runner, slackbot.Config{
 		AllowedUserIDs:    cfg.AllowedUserIDs,
 		AllowedChannelIDs: cfg.AllowedChannelIDs,
+		AllowWorkflows:    cfg.AllowWorkflows,
+		AdminUserID:       cfg.AdminUserID,
 		WorkspaceDir:      cfg.WorkspaceDir,
 		MemoryDir:         cfg.MemoryDir,
 		CodexTimeout:      cfg.CodexTimeout,

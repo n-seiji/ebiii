@@ -23,6 +23,8 @@ func TestLoad(t *testing.T) {
 				"SLACK_APP_TOKEN":           "xapp-test",
 				"SLACK_ALLOWED_USER_IDS":    " U123, ,U456 ",
 				"SLACK_ALLOWED_CHANNEL_IDS": " C123, ,C456 ",
+				"SLACK_ALLOW_WORKFLOWS":     "true",
+				"SLACK_ADMIN_USER_ID":       "UADMIN",
 				"CODEX_COMMAND":             "/usr/local/bin/codex",
 				"CODEX_MODEL":               "gpt-test",
 				"CODEX_TIMEOUT":             "45s",
@@ -36,6 +38,12 @@ func TestLoad(t *testing.T) {
 				}
 				if !reflect.DeepEqual(cfg.AllowedChannelIDs, []string{"C123", "C456"}) {
 					t.Errorf("AllowedChannelIDs = %v, want %v", cfg.AllowedChannelIDs, []string{"C123", "C456"})
+				}
+				if !cfg.AllowWorkflows {
+					t.Error("AllowWorkflows = false, want true")
+				}
+				if cfg.AdminUserID != "UADMIN" {
+					t.Errorf("AdminUserID = %q, want UADMIN", cfg.AdminUserID)
 				}
 				if cfg.CodexCommand != "/usr/local/bin/codex" {
 					t.Errorf("CodexCommand = %q, want %q", cfg.CodexCommand, "/usr/local/bin/codex")
@@ -77,6 +85,26 @@ func TestLoad(t *testing.T) {
 				"SLACK_ALLOWED_USER_IDS": "U123,W456",
 			},
 			wantErr: `SLACK_ALLOWED_USER_IDS: invalid user ID "W456"`,
+		},
+		{
+			name: "invalid allow workflows",
+			env: map[string]string{
+				"SLACK_BOT_TOKEN":        "xoxb-test",
+				"SLACK_APP_TOKEN":        "xapp-test",
+				"SLACK_ALLOWED_USER_IDS": "U123",
+				"SLACK_ALLOW_WORKFLOWS":  "sometimes",
+			},
+			wantErr: "SLACK_ALLOW_WORKFLOWS",
+		},
+		{
+			name: "invalid admin user",
+			env: map[string]string{
+				"SLACK_BOT_TOKEN":        "xoxb-test",
+				"SLACK_APP_TOKEN":        "xapp-test",
+				"SLACK_ALLOWED_USER_IDS": "U123",
+				"SLACK_ADMIN_USER_ID":    "W123",
+			},
+			wantErr: "SLACK_ADMIN_USER_ID",
 		},
 		{
 			name: "codex command contains whitespace",
@@ -376,6 +404,8 @@ func clearConfigEnv(t *testing.T) {
 		"SLACK_APP_TOKEN",
 		"SLACK_ALLOWED_USER_IDS",
 		"SLACK_ALLOWED_CHANNEL_IDS",
+		"SLACK_ALLOW_WORKFLOWS",
+		"SLACK_ADMIN_USER_ID",
 		"CODEX_COMMAND",
 		"CODEX_MODEL",
 		"CODEX_TIMEOUT",

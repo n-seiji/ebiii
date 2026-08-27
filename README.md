@@ -14,6 +14,10 @@ ebiii は、Slack の mention を受けて Codex が方針を検討し、必要�
 
 `.env.example` を `.env` にコピーし、Slack token、許可する user/channel ID などを設定します。
 
+Workflow Builder の「メッセージを送信」からの mention も受け付ける場合は、`SLACK_ALLOW_WORKFLOWS=true` にします。通常のBot投稿は拒否し、Slackイベントに `Wf` で始まる `workflow_id` が含まれるmentionだけを許可します。人・Workflowのどちらも `SLACK_ALLOWED_CHANNEL_IDS` の制限対象です。
+
+許可されていないuser、channel、Botからmentionされた場合は、`SLACK_ADMIN_USER_ID` のユーザーへ確認するよう同じスレッドに返信します。未設定時は `@seiji` というテキストを使用します。
+
 ```sh
 cp .env.example .env
 mise run build   # または: go build -o ebiii ./cmd/ebiii

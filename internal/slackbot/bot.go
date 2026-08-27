@@ -3,6 +3,7 @@ package slackbot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -28,6 +29,7 @@ const (
 	planFailureMessage    = "⚠️ 方針の検討または投稿に失敗しました。もう一度 mention してください。"
 	threadFailureMessage  = "⚠️ スレッドの読み込みに失敗したため、作業は開始していません。もう一度 mention してください。"
 	workFailureMessage    = "⚠️ 作業が完了したことを確認できませんでした。状況を確認し、新しい mention で依頼し直してください。"
+	forbiddenMessage      = "403 forbidden. %s に確認してください。"
 	planningStatus        = "が方針を考えています…"
 	workingStatus         = "が作業を進めています…"
 	statusRefreshDelay    = 80 * time.Second
@@ -66,6 +68,8 @@ type Runner interface {
 type Config struct {
 	AllowedUserIDs    []string
 	AllowedChannelIDs []string
+	AllowWorkflows    bool
+	AdminUserID       string
 	WorkspaceDir      string
 	MemoryDir         string
 	CodexTimeout      time.Duration
@@ -110,22 +114,34 @@ func New(api SlackAPI, store Store, runner Runner, config Config, playbooks []pl
 
 // HandleMention filters and processes one already-acknowledged app mention.
 func (b *Bot) HandleMention(ctx context.Context, event *slackevents.AppMentionEvent) {
-	if event == nil || event.BotID != "" || event.Edited != nil || event.User == b.config.BotUserID {
+	b.handleMention(ctx, event, "")
+}
+
+func (b *Bot) handleMention(ctx context.Context, event *slackevents.AppMentionEvent, workflowID string) {
+	if event == nil || event.Edited != nil || event.User == b.config.BotUserID {
 		return
 	}
-	message := stripBotMention(event.Text, b.config.BotUserID)
-	if message == "" {
-		return
-	}
-	if _, ok := b.allowedUsers[event.User]; !ok {
-		log.Printf("slackbot: rejecting user %q", event.User)
+	if event.BotID == "" {
+		if _, ok := b.allowedUsers[event.User]; !ok {
+			log.Printf("slackbot: rejecting user %q", event.User)
+			b.forbidden(ctx, event)
+			return
+		}
+	} else if !b.config.AllowWorkflows || !validWorkflowID(workflowID) {
+		log.Printf("slackbot: rejecting bot %q with workflow %q", event.BotID, workflowID)
+		b.forbidden(ctx, event)
 		return
 	}
 	if len(b.allowedChannels) > 0 {
 		if _, ok := b.allowedChannels[event.Channel]; !ok {
 			log.Printf("slackbot: rejecting channel %q", event.Channel)
+			b.forbidden(ctx, event)
 			return
 		}
+	}
+	message := stripBotMention(event.Text, b.config.BotUserID)
+	if message == "" {
+		return
 	}
 
 	eventKey := event.Channel + ":" + event.TimeStamp
@@ -321,6 +337,44 @@ func (b *Bot) HandleMention(ctx context.Context, event *slackevents.AppMentionEv
 		return
 	}
 	b.finalReaction(ctx, event.Channel, event.TimeStamp, true)
+}
+
+func (b *Bot) forbidden(ctx context.Context, event *slackevents.AppMentionEvent) {
+	contact := "@seiji"
+	if b.config.AdminUserID != "" {
+		contact = "<@" + b.config.AdminUserID + ">"
+	}
+	threadTS := event.ThreadTimeStamp
+	if threadTS == "" {
+		threadTS = event.TimeStamp
+	}
+	if err := b.post(ctx, event.Channel, threadTS, fmt.Sprintf(forbiddenMessage, contact)); err != nil {
+		log.Printf("slackbot: post forbidden response: %v", err)
+	}
+}
+
+func validWorkflowID(id string) bool {
+	if len(id) <= 2 || !strings.HasPrefix(id, "Wf") {
+		return false
+	}
+	for _, char := range id[2:] {
+		if (char < 'A' || char > 'Z') && (char < '0' || char > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func workflowIDFromPayload(payload json.RawMessage) string {
+	var envelope struct {
+		Event struct {
+			WorkflowID string `json:"workflow_id"`
+		} `json:"event"`
+	}
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		return ""
+	}
+	return envelope.Event.WorkflowID
 }
 
 func (b *Bot) runTurn(ctx context.Context, threadID, sandbox, cwd string, roots []string, text string, callback func(string) error) (*codex.TurnResult, error) {
@@ -612,8 +666,12 @@ func RunSocketMode(acceptCtx, turnCtx context.Context, botToken, appToken string
 			if !ok {
 				continue
 			}
+			workflowID := ""
+			if event.Request != nil {
+				workflowID = workflowIDFromPayload(event.Request.Payload)
+			}
 			wg.Go(func() {
-				bot.HandleMention(turnCtx, mention)
+				bot.handleMention(turnCtx, mention, workflowID)
 			})
 		}
 	}

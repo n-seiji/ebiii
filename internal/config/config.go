@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -20,6 +21,8 @@ type Config struct {
 	SlackAppToken     string
 	AllowedUserIDs    []string
 	AllowedChannelIDs []string
+	AllowWorkflows    bool
+	AdminUserID       string
 	CodexCommand      string
 	CodexModel        string
 	CodexTimeout      time.Duration
@@ -59,6 +62,17 @@ func Load() (*Config, error) {
 		if !strings.HasPrefix(userID, "U") {
 			return nil, fmt.Errorf("SLACK_ALLOWED_USER_IDS: invalid user ID %q: %w", userID, errors.New("must start with U"))
 		}
+	}
+	allowWorkflows := false
+	if value := strings.TrimSpace(os.Getenv("SLACK_ALLOW_WORKFLOWS")); value != "" {
+		allowWorkflows, err = strconv.ParseBool(value)
+		if err != nil {
+			return nil, fmt.Errorf("SLACK_ALLOW_WORKFLOWS %q: %w", value, err)
+		}
+	}
+	adminUserID := strings.TrimSpace(os.Getenv("SLACK_ADMIN_USER_ID"))
+	if adminUserID != "" && !strings.HasPrefix(adminUserID, "U") {
+		return nil, fmt.Errorf("SLACK_ADMIN_USER_ID: invalid user ID %q: %w", adminUserID, errors.New("must start with U"))
 	}
 
 	codexCommand := os.Getenv("CODEX_COMMAND")
@@ -101,6 +115,8 @@ func Load() (*Config, error) {
 		SlackAppToken:     appToken,
 		AllowedUserIDs:    userIDs,
 		AllowedChannelIDs: splitList(os.Getenv("SLACK_ALLOWED_CHANNEL_IDS")),
+		AllowWorkflows:    allowWorkflows,
+		AdminUserID:       adminUserID,
 		CodexCommand:      codexCommand,
 		CodexModel:        strings.TrimSpace(os.Getenv("CODEX_MODEL")),
 		CodexTimeout:      codexTimeout,

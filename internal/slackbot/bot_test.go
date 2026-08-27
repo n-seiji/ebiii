@@ -2,6 +2,7 @@ package slackbot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -208,7 +209,8 @@ func TestAllowlistRejectsUserAndChannel(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			store := &fakeStore{claim: true}
-			bot := newTestBot(t, store, &fakeSlack{}, &fakeRunner{})
+			api := &fakeSlack{}
+			bot := newTestBot(t, store, api, &fakeRunner{})
 			if test.configure != nil {
 				test.configure(bot)
 			}
@@ -216,7 +218,122 @@ func TestAllowlistRejectsUserAndChannel(t *testing.T) {
 			if store.claimCalls != 0 {
 				t.Fatalf("ClaimEvent called %d times, want 0", store.claimCalls)
 			}
+			if got := strings.Join(api.postTexts, "|"); got != "403 forbidden. @seiji に確認してください。" {
+				t.Fatalf("posts = %q, want forbidden response", got)
+			}
 		})
+	}
+}
+
+func TestAllowedWorkflowMentionIsHandled(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{}
+	runner := &fakeRunner{responses: []runnerResponse{{result: &codex.TurnResult{
+		Completed: true,
+		Messages:  []string{"## 方針\nDone.\n## 作業指示\nNONE"},
+	}}}}
+	bot := newTestBot(t, store, api, runner)
+	bot.config.AllowWorkflows = true
+	event := mention()
+	event.User = "UWORKFLOW"
+	event.BotID = "BWORKFLOW"
+
+	bot.handleMention(context.Background(), event, "Wf0BSM19MCDT")
+
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+}
+
+func TestBotMentionWithoutWorkflowIDIsForbidden(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{}
+	bot := newTestBot(t, store, api, &fakeRunner{})
+	bot.config.AllowWorkflows = true
+	event := mention()
+	event.User = "UOTHERBOT"
+	event.BotID = "BOTHER"
+
+	bot.handleMention(context.Background(), event, "")
+
+	if store.claimCalls != 0 {
+		t.Fatalf("ClaimEvent called %d times, want 0", store.claimCalls)
+	}
+	if got := strings.Join(api.postTexts, "|"); got != "403 forbidden. @seiji に確認してください。" {
+		t.Fatalf("posts = %q, want forbidden response", got)
+	}
+}
+
+func TestUnauthorizedBareMentionIsForbidden(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{}
+	bot := newTestBot(t, store, api, &fakeRunner{})
+	event := mention()
+	event.User = "UDENIED"
+	event.Text = "<@UBOT>"
+
+	bot.HandleMention(context.Background(), event)
+
+	if got := strings.Join(api.postTexts, "|"); got != "403 forbidden. @seiji に確認してください。" {
+		t.Fatalf("posts = %q, want forbidden response", got)
+	}
+}
+
+func TestWorkflowAuthorizationBoundaries(t *testing.T) {
+	tests := []struct {
+		name       string
+		enabled    bool
+		workflowID string
+		channel    string
+	}{
+		{name: "disabled", workflowID: "Wf0BSM19MCDT", channel: "C1"},
+		{name: "wrong prefix", enabled: true, workflowID: "Fx0BSM19MCDT", channel: "C1"},
+		{name: "invalid characters", enabled: true, workflowID: "WfBAD-id", channel: "C1"},
+		{name: "disallowed channel", enabled: true, workflowID: "Wf0BSM19MCDT", channel: "C2"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{claim: true}
+			api := &fakeSlack{}
+			bot := newTestBot(t, store, api, &fakeRunner{})
+			bot.config.AllowWorkflows = test.enabled
+			bot.allowedChannels = makeSet([]string{"C1"})
+			event := mention()
+			event.User = "UWORKFLOW"
+			event.BotID = "BWORKFLOW"
+			event.Channel = test.channel
+
+			bot.handleMention(context.Background(), event, test.workflowID)
+
+			if store.claimCalls != 0 {
+				t.Fatalf("ClaimEvent called %d times, want 0", store.claimCalls)
+			}
+			if got := strings.Join(api.postTexts, "|"); got != "403 forbidden. @seiji に確認してください。" {
+				t.Fatalf("posts = %q, want forbidden response", got)
+			}
+		})
+	}
+}
+
+func TestForbiddenResponseMentionsConfiguredAdmin(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{}
+	bot := newTestBot(t, store, api, &fakeRunner{})
+	bot.config.AdminUserID = "UADMIN"
+	event := mention()
+	event.User = "UDENIED"
+
+	bot.HandleMention(context.Background(), event)
+
+	if got := strings.Join(api.postTexts, "|"); got != "403 forbidden. <@UADMIN> に確認してください。" {
+		t.Fatalf("posts = %q, want configured admin mention", got)
+	}
+}
+
+func TestWorkflowIDFromPayload(t *testing.T) {
+	payload := json.RawMessage(`{"event":{"type":"app_mention","workflow_id":"Wf0BSM19MCDT"}}`)
+	if got := workflowIDFromPayload(payload); got != "Wf0BSM19MCDT" {
+		t.Fatalf("workflowIDFromPayload() = %q, want Wf0BSM19MCDT", got)
 	}
 }
 
