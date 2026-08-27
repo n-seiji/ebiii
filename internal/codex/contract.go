@@ -6,11 +6,12 @@ import (
 )
 
 const (
-	policyHeading        = "## 方針"
-	instructionHeading   = "## 作業指示"
-	memoryHeading        = "## メモリ追記"
-	globalMemoryHeading  = "## 全体メモリ追記"
-	channelMemoryHeading = "## チャンネルメモリ追記"
+	policyHeading              = "## 方針"
+	instructionHeading         = "## 作業指示"
+	memoryHeading              = "## メモリ追記"
+	globalMemoryHeading        = "## 全体メモリ追記"
+	channelMemoryHeading       = "## チャンネルメモリ追記"
+	forbiddenUserMemoryHeading = "## ユーザーメモリ追記"
 )
 
 // MemoryAppends contains optional entries proposed by a work turn. The bot
@@ -82,6 +83,8 @@ func SplitMemoryAppends(text string) (rest string, appends MemoryAppends, valid 
 		scope int
 	}
 	var sections []section
+	firstMemoryIndex := -1
+	hasForbiddenUserMemory := false
 	inFence := false
 	var fence byte
 	var fenceLen int
@@ -101,6 +104,13 @@ func SplitMemoryAppends(text string) (rest string, appends MemoryAppends, valid 
 		if inFence {
 			continue
 		}
+		if trimmed == forbiddenUserMemoryHeading {
+			if firstMemoryIndex == -1 {
+				firstMemoryIndex = i
+			}
+			hasForbiddenUserMemory = true
+			continue
+		}
 		scope := -1
 		switch trimmed {
 		case memoryHeading, globalMemoryHeading:
@@ -109,10 +119,16 @@ func SplitMemoryAppends(text string) (rest string, appends MemoryAppends, valid 
 			scope = 1
 		}
 		if scope >= 0 {
+			if firstMemoryIndex == -1 {
+				firstMemoryIndex = i
+			}
 			sections = append(sections, section{index: i, scope: scope})
 		}
 	}
 
+	if hasForbiddenUserMemory {
+		return strings.TrimSpace(strings.Join(lines[:firstMemoryIndex], "\n")), MemoryAppends{}, false
+	}
 	if len(sections) == 0 {
 		return text, MemoryAppends{}, true
 	}

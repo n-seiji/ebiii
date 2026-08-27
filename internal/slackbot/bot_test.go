@@ -742,7 +742,7 @@ func TestUserMemoryOutputIsNotAccepted(t *testing.T) {
 	bot.HandleMention(context.Background(), mention())
 
 	posts := strings.Join(api.postTexts, "|")
-	if !strings.Contains(posts, "Work completed.") || strings.Contains(posts, "メモリを更新しました") {
+	if !strings.Contains(posts, "Work completed.") || strings.Contains(posts, "メモリを更新しました") || strings.Contains(posts, "## ユーザーメモリ追記") || strings.Contains(posts, "private memory") {
 		t.Fatalf("posts = %q, want work result", posts)
 	}
 	for _, path := range []string{

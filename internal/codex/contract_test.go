@@ -237,9 +237,9 @@ func TestSplitMemoryAppends(t *testing.T) {
 		{
 			name:        "user memory heading is not accepted",
 			text:        "結果\n## ユーザーメモリ追記\n日本語を好む",
-			wantRest:    "結果\n## ユーザーメモリ追記\n日本語を好む",
+			wantRest:    "結果",
 			wantAppends: MemoryAppends{},
-			wantValid:   true,
+			wantValid:   false,
 		},
 		{
 			name: "heading in fence ignored",
