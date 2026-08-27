@@ -1,4 +1,4 @@
-// Package memory reads and appends global, user, and channel MEMORY.md files.
+// Package memory reads and appends global and channel MEMORY.md files.
 // The Codex agent never writes these files directly; the bot validates
 // proposed entries and routes them from authenticated Slack event IDs.
 package memory
@@ -27,21 +27,19 @@ type Scope string
 
 const (
 	ScopeGlobal  Scope = "global"
-	ScopeUser    Scope = "user"
 	ScopeChannel Scope = "channel"
 )
 
 // Context contains the memory visible to one Slack request.
 type Context struct {
 	Global  string
-	User    string
 	Channel string
 }
 
 // ReadContext reads global memory plus the memory belonging to the current
-// Slack user and channel. Successfully read scopes are returned even when a
-// different scope fails.
-func ReadContext(root, userID, channelID string) (Context, error) {
+// Slack channel. Successfully read scopes are returned even when a different
+// scope fails.
+func ReadContext(root, channelID string) (Context, error) {
 	var result Context
 	var errs []error
 	for _, target := range []struct {
@@ -50,7 +48,6 @@ func ReadContext(root, userID, channelID string) (Context, error) {
 		set   func(string)
 	}{
 		{scope: ScopeGlobal, set: func(value string) { result.Global = value }},
-		{scope: ScopeUser, id: userID, set: func(value string) { result.User = value }},
 		{scope: ScopeChannel, id: channelID, set: func(value string) { result.Channel = value }},
 	} {
 		dir, err := ScopeDir(root, target.scope, target.id)
@@ -70,12 +67,10 @@ func ReadContext(root, userID, channelID string) (Context, error) {
 
 // AppendScoped appends to the scope belonging to the current Slack request.
 // IDs are never supplied by the model; the bot passes the authenticated event
-// user and channel IDs so an output cannot select another scope's directory.
-func AppendScoped(root string, scope Scope, userID, channelID, entry string) (string, error) {
+// channel ID so an output cannot select another scope's directory.
+func AppendScoped(root string, scope Scope, channelID, entry string) (string, error) {
 	id := ""
 	switch scope {
-	case ScopeUser:
-		id = userID
 	case ScopeChannel:
 		id = channelID
 	}
@@ -91,11 +86,6 @@ func ScopeDir(root string, scope Scope, id string) (string, error) {
 	switch scope {
 	case ScopeGlobal:
 		return root, nil
-	case ScopeUser:
-		if !validSlackID(id, "U") {
-			return "", fmt.Errorf("invalid Slack user ID %q", id)
-		}
-		return filepath.Join(root, "users", id), nil
 	case ScopeChannel:
 		if !validSlackID(id, "CGD") {
 			return "", fmt.Errorf("invalid Slack channel ID %q", id)

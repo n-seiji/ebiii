@@ -10,15 +10,13 @@ const (
 	instructionHeading   = "## 作業指示"
 	memoryHeading        = "## メモリ追記"
 	globalMemoryHeading  = "## 全体メモリ追記"
-	userMemoryHeading    = "## ユーザーメモリ追記"
 	channelMemoryHeading = "## チャンネルメモリ追記"
 )
 
 // MemoryAppends contains optional entries proposed by a work turn. The bot
-// chooses the actual user and channel paths from the authenticated Slack event.
+// chooses the actual channel path from the authenticated Slack event.
 type MemoryAppends struct {
 	Global  string
-	User    string
 	Channel string
 }
 
@@ -74,10 +72,9 @@ func ParsePlan(text string) (string, string, error) {
 }
 
 // SplitMemoryAppends separates optional trailing scoped memory sections from
-// a work response. Sections must occur at most once and in global, user,
-// channel order. The legacy generic heading is treated as global memory.
-// Ambiguous output causes no memory writes and is stripped from the visible
-// result so a malformed user-memory proposal cannot leak into Slack.
+// a work response. Sections must occur at most once and in global, channel
+// order. The legacy generic heading is treated as global memory. Ambiguous
+// output causes no memory writes and is stripped from the visible result.
 func SplitMemoryAppends(text string) (rest string, appends MemoryAppends, valid bool) {
 	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
 	type section struct {
@@ -108,10 +105,8 @@ func SplitMemoryAppends(text string) (rest string, appends MemoryAppends, valid 
 		switch trimmed {
 		case memoryHeading, globalMemoryHeading:
 			scope = 0
-		case userMemoryHeading:
-			scope = 1
 		case channelMemoryHeading:
-			scope = 2
+			scope = 1
 		}
 		if scope >= 0 {
 			sections = append(sections, section{index: i, scope: scope})
@@ -140,8 +135,6 @@ func SplitMemoryAppends(text string) (rest string, appends MemoryAppends, valid 
 		case 0:
 			appends.Global = entry
 		case 1:
-			appends.User = entry
-		case 2:
 			appends.Channel = entry
 		}
 	}
@@ -151,7 +144,7 @@ func SplitMemoryAppends(text string) (rest string, appends MemoryAppends, valid 
 // SplitMemoryAppend preserves the original single-global-memory API.
 func SplitMemoryAppend(text string) (rest, entry string) {
 	rest, appends, valid := SplitMemoryAppends(text)
-	if !valid || appends.User != "" || appends.Channel != "" {
+	if !valid || appends.Channel != "" {
 		return text, ""
 	}
 	return rest, appends.Global

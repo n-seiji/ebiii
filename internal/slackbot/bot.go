@@ -149,11 +149,8 @@ func (b *Bot) handleMention(ctx context.Context, event *slackevents.AppMentionEv
 	if threadTS == "" {
 		threadTS = event.TimeStamp
 	}
-	// Include the user so a shared Slack thread cannot resume a Codex session
-	// containing another user's personalized memory and conversation context.
-	// v2 prevents sessions created before memory isolation from being resumed:
-	// those sessions used EBIII_HOME (which contains memory) as their cwd.
-	threadKey := "v2:" + event.Channel + ":" + threadTS + ":" + event.User
+	// v3 prevents sessions created before thread sharing from being resumed.
+	threadKey := "v3:" + event.Channel + ":" + threadTS
 
 	claimed, err := b.store.ClaimEvent(eventKey)
 	if err != nil {
@@ -194,7 +191,7 @@ func (b *Bot) handleMention(ctx context.Context, event *slackevents.AppMentionEv
 		slackThread = formatThreadContext(threadMessages, event.TimeStamp)
 	}
 	b.memoryMu.RLock()
-	memoryContext, memErr := memory.ReadContext(b.config.MemoryDir, event.User, event.Channel)
+	memoryContext, memErr := memory.ReadContext(b.config.MemoryDir, event.Channel)
 	b.memoryMu.RUnlock()
 	if memErr != nil {
 		log.Printf("slackbot: read memory: %v", memErr)
@@ -266,7 +263,7 @@ func (b *Bot) handleMention(ctx context.Context, event *slackevents.AppMentionEv
 	// contract and the bot writes them.
 	b.workMu.Lock()
 	b.memoryMu.RLock()
-	workMemoryContext, memErr := memory.ReadContext(b.config.MemoryDir, event.User, event.Channel)
+	workMemoryContext, memErr := memory.ReadContext(b.config.MemoryDir, event.Channel)
 	b.memoryMu.RUnlock()
 	if memErr != nil {
 		log.Printf("slackbot: refresh memory before work: %v", memErr)
@@ -290,7 +287,6 @@ func (b *Bot) handleMention(ctx context.Context, event *slackevents.AppMentionEv
 			entry string
 		}{
 			{scope: memory.ScopeGlobal, label: "全体", entry: memoryAppends.Global},
-			{scope: memory.ScopeUser, label: "ユーザー", entry: memoryAppends.User},
 			{scope: memory.ScopeChannel, label: "チャンネル", entry: memoryAppends.Channel},
 		}
 		b.memoryMu.Lock()
@@ -299,7 +295,7 @@ func (b *Bot) handleMention(ctx context.Context, event *slackevents.AppMentionEv
 				continue
 			}
 			written, err := memory.AppendScoped(
-				b.config.MemoryDir, target.scope, event.User, event.Channel, target.entry,
+				b.config.MemoryDir, target.scope, event.Channel, target.entry,
 			)
 			if err != nil {
 				log.Printf("slackbot: append %s memory %q: %v", target.scope, eventKey, err)

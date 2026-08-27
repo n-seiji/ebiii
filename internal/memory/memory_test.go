@@ -56,34 +56,33 @@ func TestReadCapsOversizedContent(t *testing.T) {
 	}
 }
 
-func TestReadContextSeparatesScopes(t *testing.T) {
+func TestReadContextReadsOnlyGlobalAndChannelScopes(t *testing.T) {
 	root := t.TempDir()
 	entries := []struct {
 		scope Scope
 		text  string
 	}{
 		{scope: ScopeGlobal, text: "global fact"},
-		{scope: ScopeUser, text: "user preference"},
 		{scope: ScopeChannel, text: "channel convention"},
 	}
 	for _, entry := range entries {
-		if _, err := AppendScoped(root, entry.scope, "U123", "C456", entry.text); err != nil {
+		if _, err := AppendScoped(root, entry.scope, "C456", entry.text); err != nil {
 			t.Fatalf("AppendScoped(%s) error = %v", entry.scope, err)
 		}
 	}
 
-	got, err := ReadContext(root, "U123", "C456")
+	got, err := ReadContext(root, "C456")
 	if err != nil {
 		t.Fatalf("ReadContext() error = %v", err)
 	}
-	if got.Global != "global fact" || got.User != "user preference" || got.Channel != "channel convention" {
+	if got.Global != "global fact" || got.Channel != "channel convention" {
 		t.Fatalf("ReadContext() = %#v", got)
 	}
-	other, err := ReadContext(root, "U999", "C999")
+	other, err := ReadContext(root, "C999")
 	if err != nil {
 		t.Fatalf("ReadContext(other) error = %v", err)
 	}
-	if other.Global != "global fact" || other.User != "" || other.Channel != "" {
+	if other.Global != "global fact" || other.Channel != "" {
 		t.Fatalf("ReadContext(other) = %#v", other)
 	}
 }
@@ -94,8 +93,6 @@ func TestScopeDirRejectsUnsafeIDs(t *testing.T) {
 		scope Scope
 		id    string
 	}{
-		{name: "user traversal", scope: ScopeUser, id: "U../other"},
-		{name: "wrong user prefix", scope: ScopeUser, id: "C123"},
 		{name: "channel traversal", scope: ScopeChannel, id: "C/other"},
 		{name: "unknown scope", scope: Scope("other")},
 	}
@@ -110,10 +107,10 @@ func TestScopeDirRejectsUnsafeIDs(t *testing.T) {
 
 func TestReadContextReturnsOtherScopesWhenOneFails(t *testing.T) {
 	root := t.TempDir()
-	if _, err := AppendScoped(root, ScopeGlobal, "U1", "C1", "global fact"); err != nil {
+	if _, err := AppendScoped(root, ScopeGlobal, "C1", "global fact"); err != nil {
 		t.Fatalf("append global: %v", err)
 	}
-	got, err := ReadContext(root, "unsafe/user", "C1")
+	got, err := ReadContext(root, "unsafe/channel")
 	if err == nil {
 		t.Fatalf("ReadContext() error = %v, want validation error", err)
 	}

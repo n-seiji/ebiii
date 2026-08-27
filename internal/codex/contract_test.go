@@ -222,39 +222,38 @@ func TestSplitMemoryAppends(t *testing.T) {
 		wantValid   bool
 	}{
 		{
-			name: "all scopes",
+			name: "global and channel scopes",
 			text: strings.Join([]string{
 				"完了しました。",
 				"## 全体メモリ追記", "共通知識",
-				"## ユーザーメモリ追記", "簡潔な回答を好む",
 				"## チャンネルメモリ追記", "検証用チャンネル",
 			}, "\n"),
 			wantRest: "完了しました。",
 			wantAppends: MemoryAppends{
-				Global: "共通知識", User: "簡潔な回答を好む", Channel: "検証用チャンネル",
+				Global: "共通知識", Channel: "検証用チャンネル",
 			},
 			wantValid: true,
 		},
 		{
-			name:        "user only",
+			name:        "user memory heading is not accepted",
 			text:        "結果\n## ユーザーメモリ追記\n日本語を好む",
-			wantRest:    "結果",
-			wantAppends: MemoryAppends{User: "日本語を好む"},
+			wantRest:    "結果\n## ユーザーメモリ追記\n日本語を好む",
+			wantAppends: MemoryAppends{},
 			wantValid:   true,
 		},
 		{
 			name: "heading in fence ignored",
 			text: strings.Join([]string{
-				"結果", "```", "## ユーザーメモリ追記", "偽物", "```",
+				"結果", "```", "## 全体メモリ追記", "偽物", "```",
 				"## チャンネルメモリ追記", "本物",
 			}, "\n"),
-			wantRest:    strings.Join([]string{"結果", "```", "## ユーザーメモリ追記", "偽物", "```"}, "\n"),
+			wantRest:    strings.Join([]string{"結果", "```", "## 全体メモリ追記", "偽物", "```"}, "\n"),
 			wantAppends: MemoryAppends{Channel: "本物"},
 			wantValid:   true,
 		},
 		{
 			name:     "wrong order is unchanged",
-			text:     "結果\n## チャンネルメモリ追記\n先\n## ユーザーメモリ追記\n後",
+			text:     "結果\n## チャンネルメモリ追記\n先\n## 全体メモリ追記\n後",
 			wantRest: "結果",
 		},
 		{

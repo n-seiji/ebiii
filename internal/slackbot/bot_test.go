@@ -437,7 +437,7 @@ func TestPlanWorkDone(t *testing.T) {
 	assertFinalReactionOrder(t, api.calls, "white_check_mark")
 }
 
-func TestPlanSessionsAreSeparatedByUser(t *testing.T) {
+func TestPlanSessionsAreSharedBySlackThread(t *testing.T) {
 	store := &fakeStore{claim: true}
 	runner := &fakeRunner{responses: []runnerResponse{
 		{result: &codex.TurnResult{Completed: true, Messages: []string{"## 方針\nDone.\n## 作業指示\nNONE"}}},
@@ -450,12 +450,15 @@ func TestPlanSessionsAreSeparatedByUser(t *testing.T) {
 		User: "U2", Channel: "C1", TimeStamp: "200.2", ThreadTimeStamp: "100.1", Text: "<@UBOT> do it",
 	})
 
-	want := []string{"v2:C1:100.1:U1", "v2:C1:100.1:U2"}
+	want := []string{"v3:C1:100.1", "v3:C1:100.1"}
 	if !reflect.DeepEqual(store.threadKeys, want) {
 		t.Fatalf("thread keys = %v, want %v", store.threadKeys, want)
 	}
-	if len(store.threadIDs) != 2 {
-		t.Fatalf("stored thread keys = %v, want two user-specific sessions", store.threadIDs)
+	if len(store.threadIDs) != 1 {
+		t.Fatalf("stored thread keys = %v, want one shared session", store.threadIDs)
+	}
+	if got := runner.threadIDs; !reflect.DeepEqual(got, []string{"", "plan-thread"}) {
+		t.Fatalf("runner thread IDs = %v, want second user to resume shared session", got)
 	}
 }
 
@@ -497,7 +500,7 @@ func TestFirstThreadMentionReceivesEarlierSlackMessages(t *testing.T) {
 func TestExistingPlanSessionSkipsSlackThreadFetch(t *testing.T) {
 	store := &fakeStore{
 		claim:     true,
-		threadIDs: map[string]string{"v2:C1:100.1:U1": "existing-thread"},
+		threadIDs: map[string]string{"v3:C1:100.1": "existing-thread"},
 	}
 	api := &fakeSlack{threadErr: errors.New("must not be called")}
 	runner := &fakeRunner{responses: []runnerResponse{{result: &codex.TurnResult{
@@ -646,11 +649,10 @@ func TestPlanPromptInjectsMemoryContent(t *testing.T) {
 		text  string
 	}{
 		{scope: memory.ScopeGlobal, text: "全体の学び"},
-		{scope: memory.ScopeUser, text: "ユーザーの好み"},
 		{scope: memory.ScopeChannel, text: "チャンネルの慣習"},
 	}
 	for _, entry := range entries {
-		if _, err := memory.AppendScoped(bot.config.MemoryDir, entry.scope, "U1", "C1", entry.text); err != nil {
+		if _, err := memory.AppendScoped(bot.config.MemoryDir, entry.scope, "C1", entry.text); err != nil {
 			t.Fatalf("append %s memory: %v", entry.scope, err)
 		}
 	}
@@ -661,12 +663,14 @@ func TestPlanPromptInjectsMemoryContent(t *testing.T) {
 	prompt := runner.prompts[0]
 	for _, want := range []string{
 		"<global_memory>", "全体の学び", "</global_memory>",
-		"<user_memory>", "ユーザーの好み", "</user_memory>",
 		"<channel_memory>", "チャンネルの慣習", "</channel_memory>",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("plan prompt does not contain %q", want)
 		}
+	}
+	if strings.Contains(prompt, "user_memory") {
+		t.Error("plan prompt must omit user memory")
 	}
 	if strings.Contains(prompt, "MEMORY.md") {
 		t.Error("plan prompt should inject memory content, not the file path")
@@ -686,7 +690,6 @@ func TestWorkMemoryAppendIsWrittenByBot(t *testing.T) {
 			Messages: []string{strings.Join([]string{
 				"Work completed.",
 				"## 全体メモリ追記", "ビルドは mise run build を使う",
-				"## ユーザーメモリ追記", "簡潔な日本語を好む",
 				"## チャンネルメモリ追記", "動作確認用チャンネル",
 			}, "\n")},
 		}},
@@ -701,7 +704,6 @@ func TestWorkMemoryAppendIsWrittenByBot(t *testing.T) {
 		want string
 	}{
 		{path: filepath.Join(bot.config.MemoryDir, "MEMORY.md"), want: "ビルドは mise run build を使う"},
-		{path: filepath.Join(bot.config.MemoryDir, "users", "U1", "MEMORY.md"), want: "簡潔な日本語を好む"},
 		{path: filepath.Join(bot.config.MemoryDir, "channels", "C1", "MEMORY.md"), want: "動作確認用チャンネル"},
 	}
 	for _, file := range files {
@@ -714,17 +716,17 @@ func TestWorkMemoryAppendIsWrittenByBot(t *testing.T) {
 		}
 	}
 	posts := strings.Join(api.postTexts, "|")
-	if !strings.Contains(posts, "Work completed.") || !strings.Contains(posts, "全体・ユーザー・チャンネルメモリを更新しました") {
+	if !strings.Contains(posts, "Work completed.") || !strings.Contains(posts, "全体・チャンネルメモリを更新しました") {
 		t.Fatalf("posts = %q, want work result and memory notification", posts)
 	}
-	for _, private := range []string{"ビルドは mise run build を使う", "簡潔な日本語を好む", "動作確認用チャンネル", "## ユーザーメモリ追記"} {
+	for _, private := range []string{"ビルドは mise run build を使う", "動作確認用チャンネル"} {
 		if strings.Contains(posts, private) {
 			t.Fatalf("posts = %q, should not expose memory content %q", posts, private)
 		}
 	}
 }
 
-func TestMalformedMemoryOutputIsNotPostedOrWritten(t *testing.T) {
+func TestUserMemoryOutputIsNotAccepted(t *testing.T) {
 	store := &fakeStore{claim: true}
 	api := &fakeSlack{}
 	runner := &fakeRunner{responses: []runnerResponse{
@@ -732,22 +734,25 @@ func TestMalformedMemoryOutputIsNotPostedOrWritten(t *testing.T) {
 			Completed: true,
 			Messages:  []string{"## 方針\nDo work.\n## 作業指示\nMake a change."},
 		}},
-		{result: &codex.TurnResult{
-			Completed: true,
-			Messages: []string{
-				"Work completed.\n## ユーザーメモリ追記\nprivate one\n## ユーザーメモリ追記\nprivate two",
-			},
-		}},
+		{result: &codex.TurnResult{Completed: true, Messages: []string{
+			"Work completed.\n## ユーザーメモリ追記\nprivate memory",
+		}}},
 	}}
 	bot := newTestBot(t, store, api, runner)
 	bot.HandleMention(context.Background(), mention())
 
 	posts := strings.Join(api.postTexts, "|")
-	if !strings.Contains(posts, "Work completed.") || strings.Contains(posts, "private") {
-		t.Fatalf("posts = %q, malformed private memory must be stripped", posts)
+	if !strings.Contains(posts, "Work completed.") || strings.Contains(posts, "メモリを更新しました") {
+		t.Fatalf("posts = %q, want work result", posts)
 	}
-	if _, err := os.Stat(filepath.Join(bot.config.MemoryDir, "users", "U1", "MEMORY.md")); !os.IsNotExist(err) {
-		t.Fatalf("malformed memory should not be written, stat error = %v", err)
+	for _, path := range []string{
+		filepath.Join(bot.config.MemoryDir, "MEMORY.md"),
+		filepath.Join(bot.config.MemoryDir, "users", "U1", "MEMORY.md"),
+		filepath.Join(bot.config.MemoryDir, "channels", "C1", "MEMORY.md"),
+	} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("user memory output should not be written to %s, stat error = %v", path, err)
+		}
 	}
 }
 
