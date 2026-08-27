@@ -253,9 +253,9 @@ func TestDeleteSubscriptionIfExpired(t *testing.T) {
 		wantFound   bool
 	}{
 		{name: "missing", wantDeleted: false, wantFound: false},
-		{name: "active", expiresAt: timePointer(now.Add(time.Second)), wantDeleted: false, wantFound: true},
-		{name: "boundary", expiresAt: timePointer(now), wantDeleted: true, wantFound: false},
-		{name: "expired", expiresAt: timePointer(now.Add(-time.Second)), wantDeleted: true, wantFound: false},
+		{name: "active", expiresAt: new(now.Add(time.Second)), wantDeleted: false, wantFound: true},
+		{name: "boundary", expiresAt: new(now), wantDeleted: true, wantFound: false},
+		{name: "expired", expiresAt: new(now.Add(-time.Second)), wantDeleted: true, wantFound: false},
 	}
 
 	for _, test := range tests {
@@ -474,8 +474,9 @@ func newTestStore(t *testing.T) *Store {
 	return store
 }
 
+//go:fix inline
 func timePointer(value time.Time) *time.Time {
-	return &value
+	return new(value)
 }
 
 func mustClaim(t *testing.T, store *Store, key string) {
