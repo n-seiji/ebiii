@@ -19,16 +19,18 @@ func TestLoad(t *testing.T) {
 		{
 			name: "valid",
 			env: map[string]string{
-				"SLACK_BOT_TOKEN":           "xoxb-test",
-				"SLACK_APP_TOKEN":           "xapp-test",
-				"SLACK_ALLOWED_USER_IDS":    " U123, ,U456 ",
-				"SLACK_ALLOWED_CHANNEL_IDS": " C123, ,C456 ",
-				"SLACK_ALLOW_WORKFLOWS":     "true",
-				"SLACK_ADMIN_USER_ID":       "UADMIN",
-				"CODEX_COMMAND":             "/usr/local/bin/codex",
-				"CODEX_MODEL":               "gpt-test",
-				"CODEX_TIMEOUT":             "45s",
-				"EBIII_HOME":                "data",
+				"SLACK_BOT_TOKEN":                    "xoxb-test",
+				"SLACK_APP_TOKEN":                    "xapp-test",
+				"SLACK_ALLOWED_USER_IDS":             " U123, ,U456 ",
+				"SLACK_ALLOWED_CHANNEL_IDS":          " C123, ,C456 ",
+				"SLACK_ALLOW_WORKFLOWS":              "true",
+				"SLACK_ADMIN_USER_ID":                "UADMIN",
+				"CODEX_COMMAND":                      "/usr/local/bin/codex",
+				"CODEX_MODEL":                        "gpt-test",
+				"CODEX_TIMEOUT":                      "45s",
+				"SLACK_THREAD_SUBSCRIPTION_REACTION": "follow-up",
+				"SLACK_THREAD_SUBSCRIPTION_TTL":      "48h",
+				"EBIII_HOME":                         "data",
 			},
 			check: func(t *testing.T, cfg *Config, workingDir string) {
 				t.Helper()
@@ -53,6 +55,12 @@ func TestLoad(t *testing.T) {
 				}
 				if cfg.CodexTimeout != 45*time.Second {
 					t.Errorf("CodexTimeout = %v, want %v", cfg.CodexTimeout, 45*time.Second)
+				}
+				if cfg.ThreadSubscriptionReaction != "follow-up" {
+					t.Errorf("ThreadSubscriptionReaction = %q, want %q", cfg.ThreadSubscriptionReaction, "follow-up")
+				}
+				if cfg.ThreadSubscriptionTTL != 48*time.Hour {
+					t.Errorf("ThreadSubscriptionTTL = %v, want %v", cfg.ThreadSubscriptionTTL, 48*time.Hour)
 				}
 				if cfg.EBIIIHome != wantHome {
 					t.Errorf("EBIIIHome = %q, want %q", cfg.EBIIIHome, wantHome)
@@ -144,6 +152,12 @@ func TestLoad(t *testing.T) {
 				if cfg.CodexTimeout != 30*time.Minute {
 					t.Errorf("CodexTimeout = %v, want %v", cfg.CodexTimeout, 30*time.Minute)
 				}
+				if cfg.ThreadSubscriptionReaction != "thread-subete" {
+					t.Errorf("ThreadSubscriptionReaction = %q, want %q", cfg.ThreadSubscriptionReaction, "thread-subete")
+				}
+				if cfg.ThreadSubscriptionTTL != 336*time.Hour {
+					t.Errorf("ThreadSubscriptionTTL = %v, want %v", cfg.ThreadSubscriptionTTL, 336*time.Hour)
+				}
 				if len(cfg.AllowedChannelIDs) != 0 {
 					t.Errorf("AllowedChannelIDs = %v, want %v", cfg.AllowedChannelIDs, []string(nil))
 				}
@@ -159,6 +173,45 @@ func TestLoad(t *testing.T) {
 				"CODEX_TIMEOUT":          "tomorrow",
 			},
 			wantErr: "CODEX_TIMEOUT",
+		},
+		{
+			name: "explicit empty subscription reaction disables subscriptions",
+			env: map[string]string{
+				"SLACK_BOT_TOKEN":                    "xoxb-test",
+				"SLACK_APP_TOKEN":                    "xapp-test",
+				"SLACK_ALLOWED_USER_IDS":             "U123",
+				"SLACK_THREAD_SUBSCRIPTION_REACTION": "",
+				"SLACK_THREAD_SUBSCRIPTION_TTL":      "0s",
+			},
+			check: func(t *testing.T, cfg *Config, workingDir string) {
+				t.Helper()
+				if cfg.ThreadSubscriptionReaction != "" {
+					t.Errorf("ThreadSubscriptionReaction = %q, want disabled empty reaction", cfg.ThreadSubscriptionReaction)
+				}
+				if cfg.ThreadSubscriptionTTL != 0 {
+					t.Errorf("ThreadSubscriptionTTL = %v, want 0 when subscriptions are disabled", cfg.ThreadSubscriptionTTL)
+				}
+			},
+		},
+		{
+			name: "invalid subscription TTL",
+			env: map[string]string{
+				"SLACK_BOT_TOKEN":               "xoxb-test",
+				"SLACK_APP_TOKEN":               "xapp-test",
+				"SLACK_ALLOWED_USER_IDS":        "U123",
+				"SLACK_THREAD_SUBSCRIPTION_TTL": "tomorrow",
+			},
+			wantErr: "SLACK_THREAD_SUBSCRIPTION_TTL",
+		},
+		{
+			name: "non-positive subscription TTL is rejected when subscriptions are enabled",
+			env: map[string]string{
+				"SLACK_BOT_TOKEN":               "xoxb-test",
+				"SLACK_APP_TOKEN":               "xapp-test",
+				"SLACK_ALLOWED_USER_IDS":        "U123",
+				"SLACK_THREAD_SUBSCRIPTION_TTL": "0s",
+			},
+			wantErr: "SLACK_THREAD_SUBSCRIPTION_TTL",
 		},
 	}
 
@@ -406,6 +459,8 @@ func clearConfigEnv(t *testing.T) {
 		"SLACK_ALLOWED_CHANNEL_IDS",
 		"SLACK_ALLOW_WORKFLOWS",
 		"SLACK_ADMIN_USER_ID",
+		"SLACK_THREAD_SUBSCRIPTION_REACTION",
+		"SLACK_THREAD_SUBSCRIPTION_TTL",
 		"CODEX_COMMAND",
 		"CODEX_MODEL",
 		"CODEX_TIMEOUT",

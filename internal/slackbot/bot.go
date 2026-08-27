@@ -66,14 +66,16 @@ type Runner interface {
 
 // Config contains paths, allowlists, and timeout settings needed by Bot.
 type Config struct {
-	AllowedUserIDs    []string
-	AllowedChannelIDs []string
-	AllowWorkflows    bool
-	AdminUserID       string
-	WorkspaceDir      string
-	MemoryDir         string
-	CodexTimeout      time.Duration
-	BotUserID         string
+	AllowedUserIDs             []string
+	AllowedChannelIDs          []string
+	AllowWorkflows             bool
+	AdminUserID                string
+	WorkspaceDir               string
+	MemoryDir                  string
+	CodexTimeout               time.Duration
+	ThreadSubscriptionReaction string
+	ThreadSubscriptionTTL      time.Duration
+	BotUserID                  string
 	// WritableRoots are extra directories the work turn may write to.
 	WritableRoots []string
 }
