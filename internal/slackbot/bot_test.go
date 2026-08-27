@@ -412,6 +412,24 @@ func TestDuplicateEventIsSkipped(t *testing.T) {
 	}
 }
 
+func TestDuplicateEventWithEnabledSubscriptionSkipsMarkerLookup(t *testing.T) {
+	store := &fakeStore{claim: false}
+	runner := &fakeRunner{}
+	api := &fakeSlack{hasReaction: true}
+	bot := newTestBot(t, store, api, runner)
+	bot.config.ThreadSubscriptionReaction = "thread-subete"
+	bot.config.ThreadSubscriptionTTL = 48 * time.Hour
+
+	bot.HandleMention(context.Background(), mention())
+
+	if api.reactionCalls != 0 || len(store.subscriptionCalls) != 0 {
+		t.Fatalf("duplicate event caused reaction lookups=%d subscription saves=%d, want none", api.reactionCalls, len(store.subscriptionCalls))
+	}
+	if runner.calls != 0 {
+		t.Fatalf("duplicate event caused runner=%d, want 0", runner.calls)
+	}
+}
+
 func TestMarkedMentionStartsThreadSubscription(t *testing.T) {
 	now := time.Date(2026, time.August, 27, 10, 30, 0, 0, time.UTC)
 	tests := []struct {

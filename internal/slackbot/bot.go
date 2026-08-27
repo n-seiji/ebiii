@@ -151,7 +151,6 @@ func (b *Bot) handleMention(ctx context.Context, event *slackevents.AppMentionEv
 	if threadTS == "" {
 		threadTS = event.TimeStamp
 	}
-	b.startThreadSubscription(ctx, event.Channel, threadTS)
 
 	message := stripBotMention(event.Text, b.config.BotUserID)
 	if message == "" {
@@ -173,6 +172,7 @@ func (b *Bot) handleMention(ctx context.Context, event *slackevents.AppMentionEv
 	if !claimed {
 		return
 	}
+	b.startThreadSubscription(ctx, event.Channel, threadTS)
 	b.addReaction(ctx, event.Channel, event.TimeStamp, "eyes")
 
 	if err := b.store.Transition(eventKey, state.Received, state.Planning); err != nil {
