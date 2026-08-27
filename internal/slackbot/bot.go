@@ -40,6 +40,7 @@ type SlackAPI interface {
 	PostMessage(ctx context.Context, channel, threadTS, text string) (string, error)
 	GetThreadMessages(ctx context.Context, channel, threadTS, latest string) ([]ThreadMessage, error)
 	SetStatus(ctx context.Context, channel, threadTS, status string) error
+	HasReaction(ctx context.Context, channel, timestamp, reaction string) (bool, error)
 	AddReaction(ctx context.Context, channel, timestamp, name string) error
 	RemoveReaction(ctx context.Context, channel, timestamp, name string) error
 }
@@ -57,6 +58,9 @@ type Store interface {
 	Transition(eventKey string, from, to state.State) error
 	GetThread(threadKey string) (string, bool)
 	SetThread(threadKey, threadID string) error
+	GetSubscription(threadKey string) (state.Subscription, bool)
+	SetSubscription(threadKey string, startedAt, expiresAt time.Time) error
+	DeleteSubscription(threadKey string) error
 }
 
 // Runner executes one Codex turn.
@@ -94,6 +98,7 @@ type Bot struct {
 	memoryMu        sync.RWMutex
 	threadMu        sync.Mutex
 	threadLocks     map[string]*sync.Mutex
+	now             func() time.Time
 	sleep           func(context.Context, time.Duration) error
 }
 
@@ -109,6 +114,7 @@ func New(api SlackAPI, store Store, runner Runner, config Config, playbooks []pl
 		allowedUsers:    makeSet(config.AllowedUserIDs),
 		allowedChannels: makeSet(config.AllowedChannelIDs),
 		threadLocks:     make(map[string]*sync.Mutex),
+		now:             time.Now,
 		sleep:           sleepContext,
 	}
 	return b
@@ -141,16 +147,18 @@ func (b *Bot) handleMention(ctx context.Context, event *slackevents.AppMentionEv
 			return
 		}
 	}
+	threadTS := event.ThreadTimeStamp
+	if threadTS == "" {
+		threadTS = event.TimeStamp
+	}
+	b.startThreadSubscription(ctx, event.Channel, threadTS)
+
 	message := stripBotMention(event.Text, b.config.BotUserID)
 	if message == "" {
 		return
 	}
 
 	eventKey := event.Channel + ":" + event.TimeStamp
-	threadTS := event.ThreadTimeStamp
-	if threadTS == "" {
-		threadTS = event.TimeStamp
-	}
 	// v3 prevents sessions created before thread sharing from being resumed.
 	threadKey := "v3:" + event.Channel + ":" + threadTS
 
@@ -373,6 +381,25 @@ func workflowIDFromPayload(payload json.RawMessage) string {
 		return ""
 	}
 	return envelope.Event.WorkflowID
+}
+
+func (b *Bot) startThreadSubscription(ctx context.Context, channel, threadTS string) {
+	marker := b.config.ThreadSubscriptionReaction
+	if marker == "" {
+		return
+	}
+	marked, err := b.api.HasReaction(ctx, channel, threadTS, marker)
+	if err != nil {
+		log.Printf("slackbot: read subscription marker %q: %v", channel+":"+threadTS, err)
+		return
+	}
+	if !marked {
+		return
+	}
+	now := b.now()
+	if err := b.store.SetSubscription(channel+":"+threadTS, now, now.Add(b.config.ThreadSubscriptionTTL)); err != nil {
+		log.Printf("slackbot: save subscription %q: %v", channel+":"+threadTS, err)
+	}
 }
 
 func (b *Bot) runTurn(ctx context.Context, threadID, sandbox, cwd string, roots []string, text string, callback func(string) error) (*codex.TurnResult, error) {
@@ -611,6 +638,19 @@ func (w *webAPI) SetStatus(ctx context.Context, channel, threadTS, status string
 		ThreadTS:  threadTS,
 		Status:    status,
 	})
+}
+
+func (w *webAPI) HasReaction(ctx context.Context, channel, timestamp, reaction string) (bool, error) {
+	reactions, err := w.client.GetReactionsContext(ctx, slack.ItemRef{Channel: channel, Timestamp: timestamp}, slack.GetReactionsParameters{})
+	if err != nil {
+		return false, err
+	}
+	for _, itemReaction := range reactions {
+		if itemReaction.Name == reaction {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (w *webAPI) AddReaction(ctx context.Context, channel, timestamp, name string) error {

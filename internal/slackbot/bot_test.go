@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -20,14 +22,23 @@ import (
 )
 
 type fakeStore struct {
-	mu          sync.Mutex
-	claim       bool
-	claimErr    error
-	claimCalls  int
-	current     state.State
-	transitions [][2]state.State
-	threadIDs   map[string]string
-	threadKeys  []string
+	mu                sync.Mutex
+	claim             bool
+	claimErr          error
+	claimCalls        int
+	current           state.State
+	transitions       [][2]state.State
+	threadIDs         map[string]string
+	threadKeys        []string
+	subscriptions     map[string]state.Subscription
+	subscriptionCalls []subscriptionCall
+	subscriptionErr   error
+}
+
+type subscriptionCall struct {
+	threadKey string
+	startedAt time.Time
+	expiresAt time.Time
 }
 
 func (s *fakeStore) ClaimEvent(string) (bool, error) {
@@ -69,20 +80,64 @@ func (s *fakeStore) SetThread(key, threadID string) error {
 	return nil
 }
 
+func (s *fakeStore) GetSubscription(key string) (state.Subscription, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	subscription, ok := s.subscriptions[key]
+	return subscription, ok
+}
+
+func (s *fakeStore) SetSubscription(key string, startedAt, expiresAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.subscriptionCalls = append(s.subscriptionCalls, subscriptionCall{
+		threadKey: key,
+		startedAt: startedAt,
+		expiresAt: expiresAt,
+	})
+	if s.subscriptionErr != nil {
+		return s.subscriptionErr
+	}
+	if s.subscriptions == nil {
+		s.subscriptions = make(map[string]state.Subscription)
+	}
+	s.subscriptions[key] = state.Subscription{StartedAt: startedAt, ExpiresAt: expiresAt}
+	return nil
+}
+
+func (s *fakeStore) DeleteSubscription(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.subscriptions, key)
+	return nil
+}
+
 type slackCall struct {
 	kind string
 	text string
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
+
 type fakeSlack struct {
-	mu             sync.Mutex
-	calls          []slackCall
-	postErrs       []error
-	postTexts      []string
-	threadMessages []ThreadMessage
-	threadErr      error
-	threadCalls    int
-	threadLatest   string
+	mu                sync.Mutex
+	calls             []slackCall
+	postErrs          []error
+	postTexts         []string
+	threadMessages    []ThreadMessage
+	threadErr         error
+	threadCalls       int
+	threadLatest      string
+	hasReaction       bool
+	reactionErr       error
+	reactionCalls     int
+	reactionChannel   string
+	reactionTimestamp string
+	reactionName      string
 }
 
 func (s *fakeSlack) PostMessage(_ context.Context, _, _, text string) (string, error) {
@@ -125,6 +180,16 @@ func (s *fakeSlack) RemoveReaction(_ context.Context, _, _, name string) error {
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, slackCall{kind: "remove:" + name})
 	return nil
+}
+
+func (s *fakeSlack) HasReaction(_ context.Context, channel, timestamp, reaction string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reactionCalls++
+	s.reactionChannel = channel
+	s.reactionTimestamp = timestamp
+	s.reactionName = reaction
+	return s.hasReaction, s.reactionErr
 }
 
 type runnerResponse struct {
@@ -345,6 +410,208 @@ func TestDuplicateEventIsSkipped(t *testing.T) {
 	if runner.calls != 0 || len(api.calls) != 0 {
 		t.Fatalf("duplicate event caused runner=%d Slack calls=%d", runner.calls, len(api.calls))
 	}
+}
+
+func TestMarkedMentionStartsThreadSubscription(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 10, 30, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		event      *slackevents.AppMentionEvent
+		wantThread string
+	}{
+		{name: "root mention", event: mention(), wantThread: "100.1"},
+		{
+			name: "thread parent",
+			event: &slackevents.AppMentionEvent{
+				User: "U1", Channel: "C1", TimeStamp: "200.2", ThreadTimeStamp: "100.1", Text: "<@UBOT> do it",
+			},
+			wantThread: "100.1",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{claim: true}
+			api := &fakeSlack{hasReaction: true}
+			runner := successfulPlanRunner()
+			bot := newTestBot(t, store, api, runner)
+			bot.config.ThreadSubscriptionReaction = "thread-subete"
+			bot.config.ThreadSubscriptionTTL = 48 * time.Hour
+			bot.now = func() time.Time { return now }
+
+			bot.HandleMention(context.Background(), test.event)
+
+			want := state.Subscription{StartedAt: now, ExpiresAt: now.Add(48 * time.Hour)}
+			if got, ok := store.GetSubscription("C1:" + test.wantThread); !ok || got != want {
+				t.Fatalf("subscription = (%+v, %v), want (%+v, true)", got, ok, want)
+			}
+			if api.reactionCalls != 1 || api.reactionChannel != "C1" || api.reactionTimestamp != test.wantThread || api.reactionName != "thread-subete" {
+				t.Fatalf("reaction lookup = %d calls with (%q, %q, %q), want one parent lookup", api.reactionCalls, api.reactionChannel, api.reactionTimestamp, api.reactionName)
+			}
+			if runner.calls != 1 {
+				t.Fatalf("runner calls = %d, want normal mention turn", runner.calls)
+			}
+		})
+	}
+}
+
+func TestUnmarkedMentionDoesNotStartThreadSubscription(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{}
+	runner := successfulPlanRunner()
+	bot := newTestBot(t, store, api, runner)
+	bot.config.ThreadSubscriptionReaction = "thread-subete"
+	bot.config.ThreadSubscriptionTTL = 48 * time.Hour
+
+	bot.HandleMention(context.Background(), mention())
+
+	if len(store.subscriptionCalls) != 0 {
+		t.Fatalf("subscription saves = %v, want none", store.subscriptionCalls)
+	}
+	if api.reactionCalls != 1 || runner.calls != 1 {
+		t.Fatalf("reaction lookups = %d, runner calls = %d, want 1 each", api.reactionCalls, runner.calls)
+	}
+}
+
+func TestRepeatedMarkedMentionRenewsThreadSubscription(t *testing.T) {
+	firstNow := time.Date(2026, time.August, 27, 10, 30, 0, 0, time.UTC)
+	secondNow := firstNow.Add(12 * time.Hour)
+	currentNow := firstNow
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{hasReaction: true}
+	runner := &fakeRunner{responses: append(
+		successfulPlanRunner().responses,
+		successfulPlanRunner().responses...,
+	)}
+	bot := newTestBot(t, store, api, runner)
+	bot.config.ThreadSubscriptionReaction = "thread-subete"
+	bot.config.ThreadSubscriptionTTL = 48 * time.Hour
+	bot.now = func() time.Time { return currentNow }
+
+	bot.HandleMention(context.Background(), mention())
+	currentNow = secondNow
+	bot.HandleMention(context.Background(), &slackevents.AppMentionEvent{
+		User: "U1", Channel: "C1", TimeStamp: "200.2", ThreadTimeStamp: "100.1", Text: "<@UBOT> again",
+	})
+
+	want := state.Subscription{StartedAt: secondNow, ExpiresAt: secondNow.Add(48 * time.Hour)}
+	if got, ok := store.GetSubscription("C1:100.1"); !ok || got != want {
+		t.Fatalf("renewed subscription = (%+v, %v), want (%+v, true)", got, ok, want)
+	}
+	if len(store.subscriptionCalls) != 2 || api.reactionCalls != 2 || runner.calls != 2 {
+		t.Fatalf("subscription saves = %d, reaction lookups = %d, runner calls = %d, want 2 each", len(store.subscriptionCalls), api.reactionCalls, runner.calls)
+	}
+}
+
+func TestSubscriptionStartFailuresDoNotBlockMentionTurn(t *testing.T) {
+	tests := []struct {
+		name     string
+		api      *fakeSlack
+		storeErr error
+	}{
+		{name: "reaction lookup", api: &fakeSlack{reactionErr: errors.New("Slack unavailable")}},
+		{name: "subscription save", api: &fakeSlack{hasReaction: true}, storeErr: errors.New("disk unavailable")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{claim: true, subscriptionErr: test.storeErr}
+			runner := successfulPlanRunner()
+			bot := newTestBot(t, store, test.api, runner)
+			bot.config.ThreadSubscriptionReaction = "thread-subete"
+			bot.config.ThreadSubscriptionTTL = 48 * time.Hour
+
+			bot.HandleMention(context.Background(), mention())
+
+			if runner.calls != 1 || store.current != state.Done {
+				t.Fatalf("runner calls = %d, state = %q, want normal completed mention turn", runner.calls, store.current)
+			}
+		})
+	}
+}
+
+func TestSubscriptionMarkerLookupRequiresEnabledAuthorizedMention(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*Bot)
+		event     *slackevents.AppMentionEvent
+		wantRuns  int
+	}{
+		{name: "disabled", event: mention(), wantRuns: 1},
+		{
+			name: "unauthorized",
+			configure: func(bot *Bot) {
+				bot.config.ThreadSubscriptionReaction = "thread-subete"
+				bot.config.ThreadSubscriptionTTL = 48 * time.Hour
+			},
+			event: func() *slackevents.AppMentionEvent {
+				event := mention()
+				event.User = "UDENIED"
+				return event
+			}(),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{claim: true}
+			api := &fakeSlack{hasReaction: true}
+			runner := successfulPlanRunner()
+			bot := newTestBot(t, store, api, runner)
+			if test.configure != nil {
+				test.configure(bot)
+			}
+
+			bot.HandleMention(context.Background(), test.event)
+
+			if api.reactionCalls != 0 || len(store.subscriptionCalls) != 0 {
+				t.Fatalf("reaction lookups = %d, subscription saves = %d, want none", api.reactionCalls, len(store.subscriptionCalls))
+			}
+			if runner.calls != test.wantRuns {
+				t.Fatalf("runner calls = %d, want %d", runner.calls, test.wantRuns)
+			}
+		})
+	}
+}
+
+func TestWebAPIHasReactionUsesReactionsGet(t *testing.T) {
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/reactions.get" {
+			t.Errorf("request path = %q, want /reactions.get", r.URL.Path)
+		}
+		if err := r.ParseForm(); err != nil {
+			return nil, err
+		}
+		if r.Form.Get("channel") != "C1" || r.Form.Get("timestamp") != "100.1" {
+			t.Errorf("request item = (%q, %q), want (C1, 100.1)", r.Form.Get("channel"), r.Form.Get("timestamp"))
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"type":"message","message":{"reactions":[{"name":"eyes"},{"name":"thread-subete"}]}}`)),
+			Request:    r,
+		}, nil
+	})}
+
+	api := &webAPI{client: slack.New("token", slack.OptionAPIURL("https://slack.test/"), slack.OptionHTTPClient(httpClient))}
+	marked, err := api.HasReaction(context.Background(), "C1", "100.1", "thread-subete")
+	if err != nil {
+		t.Fatalf("HasReaction() error = %v, want nil", err)
+	}
+	if !marked {
+		t.Fatal("HasReaction() = false, want true")
+	}
+	marked, err = api.HasReaction(context.Background(), "C1", "100.1", "missing")
+	if err != nil {
+		t.Fatalf("HasReaction() for absent reaction error = %v, want nil", err)
+	}
+	if marked {
+		t.Fatal("HasReaction() for absent reaction = true, want false")
+	}
+}
+
+func successfulPlanRunner() *fakeRunner {
+	return &fakeRunner{responses: []runnerResponse{{result: &codex.TurnResult{
+		Completed: true,
+		Messages:  []string{"## 方針\nDone.\n## 作業指示\nNONE"},
+	}}}}
 }
 
 func TestFailClosedTransitionsToDoneWithCheckmark(t *testing.T) {
@@ -799,6 +1066,14 @@ func (s *looseStore) SetThread(key, threadID string) error {
 	s.threads[key] = threadID
 	return nil
 }
+
+func (s *looseStore) GetSubscription(string) (state.Subscription, bool) {
+	return state.Subscription{}, false
+}
+
+func (s *looseStore) SetSubscription(string, time.Time, time.Time) error { return nil }
+
+func (s *looseStore) DeleteSubscription(string) error { return nil }
 
 // gatedRunner holds the work turn open until release is closed so a test can
 // observe what other turns may run concurrently.
