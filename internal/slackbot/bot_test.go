@@ -2,7 +2,10 @@ package slackbot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -19,14 +22,24 @@ import (
 )
 
 type fakeStore struct {
-	mu          sync.Mutex
-	claim       bool
-	claimErr    error
-	claimCalls  int
-	current     state.State
-	transitions [][2]state.State
-	threadIDs   map[string]string
-	threadKeys  []string
+	mu                  sync.Mutex
+	claim               bool
+	claimErr            error
+	claimCalls          int
+	current             state.State
+	transitions         [][2]state.State
+	threadIDs           map[string]string
+	threadKeys          []string
+	subscriptions       map[string]state.Subscription
+	subscriptionCalls   []subscriptionCall
+	subscriptionDeletes []string
+	subscriptionErr     error
+}
+
+type subscriptionCall struct {
+	threadKey string
+	startedAt time.Time
+	expiresAt time.Time
 }
 
 func (s *fakeStore) ClaimEvent(string) (bool, error) {
@@ -68,20 +81,70 @@ func (s *fakeStore) SetThread(key, threadID string) error {
 	return nil
 }
 
+func (s *fakeStore) GetSubscription(key string) (state.Subscription, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	subscription, ok := s.subscriptions[key]
+	return subscription, ok
+}
+
+func (s *fakeStore) SetSubscription(key string, startedAt, expiresAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.subscriptionCalls = append(s.subscriptionCalls, subscriptionCall{
+		threadKey: key,
+		startedAt: startedAt,
+		expiresAt: expiresAt,
+	})
+	if s.subscriptionErr != nil {
+		return s.subscriptionErr
+	}
+	if s.subscriptions == nil {
+		s.subscriptions = make(map[string]state.Subscription)
+	}
+	s.subscriptions[key] = state.Subscription{StartedAt: startedAt, ExpiresAt: expiresAt}
+	return nil
+}
+
+func (s *fakeStore) DeleteSubscriptionIfExpired(key string, now time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	subscription, ok := s.subscriptions[key]
+	if !ok || subscription.ExpiresAt.After(now) {
+		return false, nil
+	}
+	s.subscriptionDeletes = append(s.subscriptionDeletes, key)
+	delete(s.subscriptions, key)
+	return true, nil
+}
+
 type slackCall struct {
 	kind string
 	text string
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
+
 type fakeSlack struct {
-	mu             sync.Mutex
-	calls          []slackCall
-	postErrs       []error
-	postTexts      []string
-	threadMessages []ThreadMessage
-	threadErr      error
-	threadCalls    int
-	threadLatest   string
+	mu                sync.Mutex
+	calls             []slackCall
+	postErrs          []error
+	postTexts         []string
+	threadMessages    []ThreadMessage
+	threadErr         error
+	threadCalls       int
+	threadLatest      string
+	hasReaction       bool
+	reactionErr       error
+	reactionErrs      []error
+	reactionCalls     int
+	reactionChannel   string
+	reactionTimestamp string
+	reactionName      string
 }
 
 func (s *fakeSlack) PostMessage(_ context.Context, _, _, text string) (string, error) {
@@ -126,6 +189,21 @@ func (s *fakeSlack) RemoveReaction(_ context.Context, _, _, name string) error {
 	return nil
 }
 
+func (s *fakeSlack) HasReaction(_ context.Context, channel, timestamp, reaction string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reactionCalls++
+	s.reactionChannel = channel
+	s.reactionTimestamp = timestamp
+	s.reactionName = reaction
+	if len(s.reactionErrs) > 0 {
+		err := s.reactionErrs[0]
+		s.reactionErrs = s.reactionErrs[1:]
+		return s.hasReaction, err
+	}
+	return s.hasReaction, s.reactionErr
+}
+
 type runnerResponse struct {
 	result *codex.TurnResult
 	err    error
@@ -140,12 +218,16 @@ type fakeRunner struct {
 	cwds      []string
 	roots     [][]string
 	prompts   []string
+	onRun     func(call int)
 }
 
 func (r *fakeRunner) Run(_ context.Context, threadID, sandbox, cwd string, roots []string, prompt string, callback func(string) error) (*codex.TurnResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls++
+	if r.onRun != nil {
+		r.onRun(r.calls)
+	}
 	r.threadIDs = append(r.threadIDs, threadID)
 	r.sandboxes = append(r.sandboxes, sandbox)
 	r.cwds = append(r.cwds, cwd)
@@ -181,6 +263,30 @@ func mention() *slackevents.AppMentionEvent {
 	}
 }
 
+func messageReply(user, timestamp, text string) *slackevents.MessageEvent {
+	return &slackevents.MessageEvent{
+		Type:            "message",
+		User:            user,
+		Text:            text,
+		ThreadTimeStamp: "100.1",
+		TimeStamp:       timestamp,
+		Channel:         "C1",
+		ChannelType:     "channel",
+	}
+}
+
+func configureActiveSubscription(bot *Bot, store *fakeStore, now time.Time) {
+	bot.allowedChannels = makeSet([]string{"C1"})
+	bot.now = func() time.Time { return now }
+	if store.subscriptions == nil {
+		store.subscriptions = make(map[string]state.Subscription)
+	}
+	store.subscriptions["C1:100.1"] = state.Subscription{
+		StartedAt: now.Add(-time.Hour),
+		ExpiresAt: now.Add(time.Hour),
+	}
+}
+
 func TestAllowlistRejectsUserAndChannel(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -204,7 +310,8 @@ func TestAllowlistRejectsUserAndChannel(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			store := &fakeStore{claim: true}
-			bot := newTestBot(t, store, &fakeSlack{}, &fakeRunner{})
+			api := &fakeSlack{}
+			bot := newTestBot(t, store, api, &fakeRunner{})
 			if test.configure != nil {
 				test.configure(bot)
 			}
@@ -212,7 +319,122 @@ func TestAllowlistRejectsUserAndChannel(t *testing.T) {
 			if store.claimCalls != 0 {
 				t.Fatalf("ClaimEvent called %d times, want 0", store.claimCalls)
 			}
+			if got := strings.Join(api.postTexts, "|"); got != "403 forbidden. @seiji に確認してください。" {
+				t.Fatalf("posts = %q, want forbidden response", got)
+			}
 		})
+	}
+}
+
+func TestAllowedWorkflowMentionIsHandled(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{}
+	runner := &fakeRunner{responses: []runnerResponse{{result: &codex.TurnResult{
+		Completed: true,
+		Messages:  []string{"## 方針\nDone.\n## 作業指示\nNONE"},
+	}}}}
+	bot := newTestBot(t, store, api, runner)
+	bot.config.AllowWorkflows = true
+	event := mention()
+	event.User = "UWORKFLOW"
+	event.BotID = "BWORKFLOW"
+
+	bot.handleMention(context.Background(), event, "Wf0BSM19MCDT")
+
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+}
+
+func TestBotMentionWithoutWorkflowIDIsForbidden(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{}
+	bot := newTestBot(t, store, api, &fakeRunner{})
+	bot.config.AllowWorkflows = true
+	event := mention()
+	event.User = "UOTHERBOT"
+	event.BotID = "BOTHER"
+
+	bot.handleMention(context.Background(), event, "")
+
+	if store.claimCalls != 0 {
+		t.Fatalf("ClaimEvent called %d times, want 0", store.claimCalls)
+	}
+	if got := strings.Join(api.postTexts, "|"); got != "403 forbidden. @seiji に確認してください。" {
+		t.Fatalf("posts = %q, want forbidden response", got)
+	}
+}
+
+func TestUnauthorizedBareMentionIsForbidden(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{}
+	bot := newTestBot(t, store, api, &fakeRunner{})
+	event := mention()
+	event.User = "UDENIED"
+	event.Text = "<@UBOT>"
+
+	bot.HandleMention(context.Background(), event)
+
+	if got := strings.Join(api.postTexts, "|"); got != "403 forbidden. @seiji に確認してください。" {
+		t.Fatalf("posts = %q, want forbidden response", got)
+	}
+}
+
+func TestWorkflowAuthorizationBoundaries(t *testing.T) {
+	tests := []struct {
+		name       string
+		enabled    bool
+		workflowID string
+		channel    string
+	}{
+		{name: "disabled", workflowID: "Wf0BSM19MCDT", channel: "C1"},
+		{name: "wrong prefix", enabled: true, workflowID: "Fx0BSM19MCDT", channel: "C1"},
+		{name: "invalid characters", enabled: true, workflowID: "WfBAD-id", channel: "C1"},
+		{name: "disallowed channel", enabled: true, workflowID: "Wf0BSM19MCDT", channel: "C2"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{claim: true}
+			api := &fakeSlack{}
+			bot := newTestBot(t, store, api, &fakeRunner{})
+			bot.config.AllowWorkflows = test.enabled
+			bot.allowedChannels = makeSet([]string{"C1"})
+			event := mention()
+			event.User = "UWORKFLOW"
+			event.BotID = "BWORKFLOW"
+			event.Channel = test.channel
+
+			bot.handleMention(context.Background(), event, test.workflowID)
+
+			if store.claimCalls != 0 {
+				t.Fatalf("ClaimEvent called %d times, want 0", store.claimCalls)
+			}
+			if got := strings.Join(api.postTexts, "|"); got != "403 forbidden. @seiji に確認してください。" {
+				t.Fatalf("posts = %q, want forbidden response", got)
+			}
+		})
+	}
+}
+
+func TestForbiddenResponseMentionsConfiguredAdmin(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{}
+	bot := newTestBot(t, store, api, &fakeRunner{})
+	bot.config.AdminUserID = "UADMIN"
+	event := mention()
+	event.User = "UDENIED"
+
+	bot.HandleMention(context.Background(), event)
+
+	if got := strings.Join(api.postTexts, "|"); got != "403 forbidden. <@UADMIN> に確認してください。" {
+		t.Fatalf("posts = %q, want configured admin mention", got)
+	}
+}
+
+func TestWorkflowIDFromPayload(t *testing.T) {
+	payload := json.RawMessage(`{"event":{"type":"app_mention","workflow_id":"Wf0BSM19MCDT"}}`)
+	if got := workflowIDFromPayload(payload); got != "Wf0BSM19MCDT" {
+		t.Fatalf("workflowIDFromPayload() = %q, want Wf0BSM19MCDT", got)
 	}
 }
 
@@ -224,6 +446,615 @@ func TestDuplicateEventIsSkipped(t *testing.T) {
 	if runner.calls != 0 || len(api.calls) != 0 {
 		t.Fatalf("duplicate event caused runner=%d Slack calls=%d", runner.calls, len(api.calls))
 	}
+}
+
+func TestDuplicateEventWithEnabledSubscriptionSkipsMarkerLookup(t *testing.T) {
+	store := &fakeStore{claim: false}
+	runner := &fakeRunner{}
+	api := &fakeSlack{hasReaction: true}
+	bot := newTestBot(t, store, api, runner)
+	bot.config.ThreadSubscriptionReaction = "thread-subete"
+	bot.config.ThreadSubscriptionTTL = 48 * time.Hour
+
+	bot.HandleMention(context.Background(), mention())
+
+	if api.reactionCalls != 0 || len(store.subscriptionCalls) != 0 {
+		t.Fatalf("duplicate event caused reaction lookups=%d subscription saves=%d, want none", api.reactionCalls, len(store.subscriptionCalls))
+	}
+	if runner.calls != 0 {
+		t.Fatalf("duplicate event caused runner=%d, want 0", runner.calls)
+	}
+}
+
+func TestMarkedMentionStartsThreadSubscription(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 10, 30, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		event      *slackevents.AppMentionEvent
+		wantThread string
+	}{
+		{name: "root mention", event: mention(), wantThread: "100.1"},
+		{
+			name: "thread parent",
+			event: &slackevents.AppMentionEvent{
+				User: "U1", Channel: "C1", TimeStamp: "200.2", ThreadTimeStamp: "100.1", Text: "<@UBOT> do it",
+			},
+			wantThread: "100.1",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{claim: true}
+			api := &fakeSlack{hasReaction: true}
+			runner := successfulPlanRunner()
+			bot := newTestBot(t, store, api, runner)
+			bot.config.ThreadSubscriptionReaction = "thread-subete"
+			bot.config.ThreadSubscriptionTTL = 48 * time.Hour
+			bot.now = func() time.Time { return now }
+
+			bot.HandleMention(context.Background(), test.event)
+
+			want := state.Subscription{StartedAt: now, ExpiresAt: now.Add(48 * time.Hour)}
+			if got, ok := store.GetSubscription("C1:" + test.wantThread); !ok || got != want {
+				t.Fatalf("subscription = (%+v, %v), want (%+v, true)", got, ok, want)
+			}
+			if api.reactionCalls != 1 || api.reactionChannel != "C1" || api.reactionTimestamp != test.wantThread || api.reactionName != "thread-subete" {
+				t.Fatalf("reaction lookup = %d calls with (%q, %q, %q), want one parent lookup", api.reactionCalls, api.reactionChannel, api.reactionTimestamp, api.reactionName)
+			}
+			if runner.calls != 1 {
+				t.Fatalf("runner calls = %d, want normal mention turn", runner.calls)
+			}
+		})
+	}
+}
+
+func TestUnmarkedMentionDoesNotStartThreadSubscription(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{}
+	runner := successfulPlanRunner()
+	bot := newTestBot(t, store, api, runner)
+	bot.config.ThreadSubscriptionReaction = "thread-subete"
+	bot.config.ThreadSubscriptionTTL = 48 * time.Hour
+
+	bot.HandleMention(context.Background(), mention())
+
+	if len(store.subscriptionCalls) != 0 {
+		t.Fatalf("subscription saves = %v, want none", store.subscriptionCalls)
+	}
+	if api.reactionCalls != 1 || runner.calls != 1 {
+		t.Fatalf("reaction lookups = %d, runner calls = %d, want 1 each", api.reactionCalls, runner.calls)
+	}
+}
+
+func TestRepeatedMarkedMentionRenewsThreadSubscription(t *testing.T) {
+	firstNow := time.Date(2026, time.August, 27, 10, 30, 0, 0, time.UTC)
+	secondNow := firstNow.Add(12 * time.Hour)
+	currentNow := firstNow
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{hasReaction: true}
+	runner := &fakeRunner{responses: append(
+		successfulPlanRunner().responses,
+		successfulPlanRunner().responses...,
+	)}
+	bot := newTestBot(t, store, api, runner)
+	bot.config.ThreadSubscriptionReaction = "thread-subete"
+	bot.config.ThreadSubscriptionTTL = 48 * time.Hour
+	bot.now = func() time.Time { return currentNow }
+
+	bot.HandleMention(context.Background(), mention())
+	currentNow = secondNow
+	bot.HandleMention(context.Background(), &slackevents.AppMentionEvent{
+		User: "U1", Channel: "C1", TimeStamp: "200.2", ThreadTimeStamp: "100.1", Text: "<@UBOT> again",
+	})
+
+	want := state.Subscription{StartedAt: secondNow, ExpiresAt: secondNow.Add(48 * time.Hour)}
+	if got, ok := store.GetSubscription("C1:100.1"); !ok || got != want {
+		t.Fatalf("renewed subscription = (%+v, %v), want (%+v, true)", got, ok, want)
+	}
+	if len(store.subscriptionCalls) != 2 || api.reactionCalls != 2 || runner.calls != 2 {
+		t.Fatalf("subscription saves = %d, reaction lookups = %d, runner calls = %d, want 2 each", len(store.subscriptionCalls), api.reactionCalls, runner.calls)
+	}
+}
+
+func TestSubscriptionStartFailuresDoNotBlockMentionTurn(t *testing.T) {
+	tests := []struct {
+		name     string
+		api      *fakeSlack
+		storeErr error
+	}{
+		{name: "reaction lookup", api: &fakeSlack{reactionErr: errors.New("Slack unavailable")}},
+		{name: "subscription save", api: &fakeSlack{hasReaction: true}, storeErr: errors.New("disk unavailable")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{claim: true, subscriptionErr: test.storeErr}
+			runner := successfulPlanRunner()
+			bot := newTestBot(t, store, test.api, runner)
+			bot.config.ThreadSubscriptionReaction = "thread-subete"
+			bot.config.ThreadSubscriptionTTL = 48 * time.Hour
+
+			bot.HandleMention(context.Background(), mention())
+
+			if runner.calls != 1 || store.current != state.Done {
+				t.Fatalf("runner calls = %d, state = %q, want normal completed mention turn", runner.calls, store.current)
+			}
+		})
+	}
+}
+
+func TestSubscriptionMarkerLookupRetriesTransientSlackErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		firstError error
+		wantWait   time.Duration
+	}{
+		{
+			name:       "rate limit honors Retry-After",
+			firstError: &slack.RateLimitedError{RetryAfter: 3 * time.Second},
+			wantWait:   3 * time.Second,
+		},
+		{
+			name:       "server error retries immediately",
+			firstError: slack.StatusCodeError{Code: http.StatusServiceUnavailable, Status: http.StatusText(http.StatusServiceUnavailable)},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{claim: true}
+			api := &fakeSlack{hasReaction: true, reactionErrs: []error{test.firstError, nil}}
+			runner := successfulPlanRunner()
+			bot := newTestBot(t, store, api, runner)
+			bot.config.ThreadSubscriptionReaction = "thread-subete"
+			bot.config.ThreadSubscriptionTTL = 48 * time.Hour
+			var waits []time.Duration
+			bot.sleep = func(_ context.Context, duration time.Duration) error {
+				waits = append(waits, duration)
+				return nil
+			}
+
+			bot.HandleMention(context.Background(), mention())
+
+			if api.reactionCalls != 2 {
+				t.Fatalf("reaction lookup calls = %d, want 2", api.reactionCalls)
+			}
+			if len(store.subscriptionCalls) != 1 {
+				t.Fatalf("subscription saves = %d, want 1 after successful retry", len(store.subscriptionCalls))
+			}
+			var wantWaits []time.Duration
+			if test.wantWait != 0 {
+				wantWaits = []time.Duration{test.wantWait}
+			}
+			if !reflect.DeepEqual(waits, wantWaits) {
+				t.Fatalf("retry waits = %v, want %v", waits, wantWaits)
+			}
+			if runner.calls != 1 || store.current != state.Done {
+				t.Fatalf("runner calls = %d, state = %q, want completed mention", runner.calls, store.current)
+			}
+		})
+	}
+}
+
+func TestSubscriptionMarkerLookupSecondFailureSkipsSubscriptionAndContinuesMention(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{hasReaction: true, reactionErrs: []error{
+		slack.StatusCodeError{Code: http.StatusBadGateway, Status: http.StatusText(http.StatusBadGateway)},
+		slack.StatusCodeError{Code: http.StatusServiceUnavailable, Status: http.StatusText(http.StatusServiceUnavailable)},
+	}}
+	runner := successfulPlanRunner()
+	bot := newTestBot(t, store, api, runner)
+	bot.config.ThreadSubscriptionReaction = "thread-subete"
+	bot.config.ThreadSubscriptionTTL = 48 * time.Hour
+
+	bot.HandleMention(context.Background(), mention())
+
+	if api.reactionCalls != 2 {
+		t.Fatalf("reaction lookup calls = %d, want one retry", api.reactionCalls)
+	}
+	if len(store.subscriptionCalls) != 0 {
+		t.Fatalf("subscription saves = %v, want none after final lookup failure", store.subscriptionCalls)
+	}
+	if runner.calls != 1 || store.current != state.Done {
+		t.Fatalf("runner calls = %d, state = %q, want fail-open completed mention", runner.calls, store.current)
+	}
+}
+
+func TestSubscriptionMarkerLookupDoesNotRetryPermanent4xx(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{hasReaction: true, reactionErrs: []error{
+		slack.StatusCodeError{Code: http.StatusBadRequest, Status: http.StatusText(http.StatusBadRequest)},
+	}}
+	runner := successfulPlanRunner()
+	bot := newTestBot(t, store, api, runner)
+	bot.config.ThreadSubscriptionReaction = "thread-subete"
+	bot.config.ThreadSubscriptionTTL = 48 * time.Hour
+
+	bot.HandleMention(context.Background(), mention())
+
+	if api.reactionCalls != 1 {
+		t.Fatalf("reaction lookup calls = %d, want no retry", api.reactionCalls)
+	}
+	if len(store.subscriptionCalls) != 0 {
+		t.Fatalf("subscription saves = %v, want none after permanent lookup failure", store.subscriptionCalls)
+	}
+	if runner.calls != 1 || store.current != state.Done {
+		t.Fatalf("runner calls = %d, state = %q, want fail-open completed mention", runner.calls, store.current)
+	}
+}
+
+func TestSubscriptionMarkerLookupRequiresEnabledAuthorizedMention(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*Bot)
+		event     *slackevents.AppMentionEvent
+		wantRuns  int
+	}{
+		{name: "disabled", event: mention(), wantRuns: 1},
+		{
+			name: "unauthorized",
+			configure: func(bot *Bot) {
+				bot.config.ThreadSubscriptionReaction = "thread-subete"
+				bot.config.ThreadSubscriptionTTL = 48 * time.Hour
+			},
+			event: func() *slackevents.AppMentionEvent {
+				event := mention()
+				event.User = "UDENIED"
+				return event
+			}(),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{claim: true}
+			api := &fakeSlack{hasReaction: true}
+			runner := successfulPlanRunner()
+			bot := newTestBot(t, store, api, runner)
+			if test.configure != nil {
+				test.configure(bot)
+			}
+
+			bot.HandleMention(context.Background(), test.event)
+
+			if api.reactionCalls != 0 || len(store.subscriptionCalls) != 0 {
+				t.Fatalf("reaction lookups = %d, subscription saves = %d, want none", api.reactionCalls, len(store.subscriptionCalls))
+			}
+			if runner.calls != test.wantRuns {
+				t.Fatalf("runner calls = %d, want %d", runner.calls, test.wantRuns)
+			}
+		})
+	}
+}
+
+func TestWebAPIHasReactionUsesReactionsGet(t *testing.T) {
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/reactions.get" {
+			t.Errorf("request path = %q, want /reactions.get", r.URL.Path)
+		}
+		if err := r.ParseForm(); err != nil {
+			return nil, err
+		}
+		if r.Form.Get("channel") != "C1" || r.Form.Get("timestamp") != "100.1" {
+			t.Errorf("request item = (%q, %q), want (C1, 100.1)", r.Form.Get("channel"), r.Form.Get("timestamp"))
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"type":"message","message":{"reactions":[{"name":"eyes"},{"name":"thread-subete"}]}}`)),
+			Request:    r,
+		}, nil
+	})}
+
+	api := &webAPI{client: slack.New("token", slack.OptionAPIURL("https://slack.test/"), slack.OptionHTTPClient(httpClient))}
+	marked, err := api.HasReaction(context.Background(), "C1", "100.1", "thread-subete")
+	if err != nil {
+		t.Fatalf("HasReaction() error = %v, want nil", err)
+	}
+	if !marked {
+		t.Fatal("HasReaction() = false, want true")
+	}
+	marked, err = api.HasReaction(context.Background(), "C1", "100.1", "missing")
+	if err != nil {
+		t.Fatalf("HasReaction() for absent reaction error = %v, want nil", err)
+	}
+	if marked {
+		t.Fatal("HasReaction() for absent reaction = true, want false")
+	}
+}
+
+func TestAllowedActiveMessageReplyRunsPlanningInSharedThreadSession(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{}
+	runner := successfulPlanRunner()
+	bot := newTestBot(t, store, api, runner)
+	configureActiveSubscription(bot, store, now)
+
+	bot.HandleMessage(context.Background(), messageReply("U2", "200.2", "please continue"))
+
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	if got := store.threadKeys; !reflect.DeepEqual(got, []string{"v3:C1:100.1"}) {
+		t.Fatalf("thread keys = %v, want v3 channel/thread session", got)
+	}
+	if len(runner.prompts) != 1 {
+		t.Fatalf("runner prompts = %d, want 1", len(runner.prompts))
+	}
+	for _, want := range []string{
+		"<authenticated_slack_author_id>\nU2\n</authenticated_slack_author_id>",
+		"<message_text>\nplease continue\n</message_text>",
+		"## 方針",
+		"## 作業指示",
+	} {
+		if !strings.Contains(runner.prompts[0], want) {
+			t.Errorf("message plan prompt does not contain %q", want)
+		}
+	}
+	if api.reactionCalls != 0 {
+		t.Fatalf("message reply reaction lookups = %d, want 0", api.reactionCalls)
+	}
+	if len(store.subscriptionCalls) != 0 {
+		t.Fatalf("message reply renewed subscription: %v", store.subscriptionCalls)
+	}
+	wantSubscription := state.Subscription{StartedAt: now.Add(-time.Hour), ExpiresAt: now.Add(time.Hour)}
+	if got, ok := store.GetSubscription("C1:100.1"); !ok || got != wantSubscription {
+		t.Fatalf("subscription after reply = (%+v, %v), want unchanged (%+v, true)", got, ok, wantSubscription)
+	}
+}
+
+func TestAllowedActiveHumanThreadBroadcastRunsPlanning(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	store := &fakeStore{claim: true}
+	runner := successfulPlanRunner()
+	bot := newTestBot(t, store, &fakeSlack{}, runner)
+	configureActiveSubscription(bot, store, now)
+	event := messageReply("U2", "200.2", "broadcast follow up")
+	event.SubType = slack.MsgSubTypeThreadBroadcast
+
+	bot.HandleMessage(context.Background(), event)
+
+	if runner.calls != 1 {
+		t.Fatalf("thread broadcast runner calls = %d, want 1", runner.calls)
+	}
+	if store.claimCalls != 1 {
+		t.Fatalf("thread broadcast claim calls = %d, want 1", store.claimCalls)
+	}
+}
+
+func TestMessageRepliesFromMultipleAuthorsShareOneSession(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	store := &fakeStore{claim: true}
+	runner := &fakeRunner{responses: append(
+		successfulPlanRunner().responses,
+		successfulPlanRunner().responses...,
+	)}
+	bot := newTestBot(t, store, &fakeSlack{}, runner)
+	configureActiveSubscription(bot, store, now)
+
+	bot.HandleMessage(context.Background(), messageReply("U2", "200.2", "first reply"))
+	bot.HandleMessage(context.Background(), messageReply("U3", "300.3", "second reply"))
+
+	if got := store.threadKeys; !reflect.DeepEqual(got, []string{"v3:C1:100.1", "v3:C1:100.1"}) {
+		t.Fatalf("thread keys = %v, want one shared Slack thread key", got)
+	}
+	if got := runner.threadIDs; !reflect.DeepEqual(got, []string{"", "plan-thread"}) {
+		t.Fatalf("runner thread IDs = %v, want second author to resume first author's session", got)
+	}
+	if len(runner.prompts) != 2 ||
+		!strings.Contains(runner.prompts[0], "<authenticated_slack_author_id>\nU2\n") ||
+		!strings.Contains(runner.prompts[1], "<authenticated_slack_author_id>\nU3\n") {
+		t.Fatalf("prompts do not preserve authenticated authors: %q", runner.prompts)
+	}
+}
+
+func TestMessageReplyCheapFiltersSkipProcessing(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*Bot, *fakeStore)
+		event     *slackevents.MessageEvent
+	}{
+		{
+			name: "disallowed channel",
+			configure: func(_ *Bot, store *fakeStore) {
+				store.subscriptions["C2:100.1"] = state.Subscription{ExpiresAt: time.Now().Add(time.Hour)}
+			},
+			event: func() *slackevents.MessageEvent {
+				event := messageReply("U2", "200.2", "ignored")
+				event.Channel = "C2"
+				return event
+			}(),
+		},
+		{name: "root message", event: func() *slackevents.MessageEvent {
+			event := messageReply("U2", "200.2", "ignored")
+			event.ThreadTimeStamp = ""
+			return event
+		}()},
+		{
+			name: "bot subtype",
+			event: func() *slackevents.MessageEvent {
+				event := messageReply("UBOT2", "200.2", "ignored")
+				event.SubType = "bot_message"
+				event.BotID = "B2"
+				return event
+			}(),
+		},
+		{name: "edit", event: func() *slackevents.MessageEvent {
+			event := messageReply("U2", "200.2", "edited")
+			event.SubType = "message_changed"
+			event.Message = &slack.Msg{Edited: &slack.Edited{User: "U2", Timestamp: "300.3"}}
+			return event
+		}()},
+		{name: "delete", event: func() *slackevents.MessageEvent {
+			event := messageReply("U2", "200.2", "deleted")
+			event.SubType = "message_deleted"
+			event.DeletedTimeStamp = "200.2"
+			return event
+		}()},
+		{name: "contains ebi mention", event: messageReply("U2", "200.2", "please <@UBOT> continue")},
+		{name: "private channel", event: func() *slackevents.MessageEvent {
+			event := messageReply("U2", "200.2", "ignored")
+			event.ChannelType = "group"
+			return event
+		}()},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{claim: true, subscriptions: map[string]state.Subscription{
+				"C1:100.1": {ExpiresAt: time.Now().Add(time.Hour)},
+			}}
+			api := &fakeSlack{hasReaction: true}
+			runner := &fakeRunner{}
+			bot := newTestBot(t, store, api, runner)
+			bot.allowedChannels = makeSet([]string{"C1"})
+			if test.configure != nil {
+				test.configure(bot, store)
+			}
+
+			bot.HandleMessage(context.Background(), test.event)
+
+			if store.claimCalls != 0 || runner.calls != 0 || len(api.calls) != 0 || api.threadCalls != 0 || api.reactionCalls != 0 {
+				t.Fatalf("ignored message caused claim=%d runner=%d Slack calls=%d thread reads=%d reaction lookups=%d",
+					store.claimCalls, runner.calls, len(api.calls), api.threadCalls, api.reactionCalls)
+			}
+		})
+	}
+}
+
+func TestMessageReplyWithoutSubscriptionIsIgnored(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{hasReaction: true}
+	runner := &fakeRunner{}
+	bot := newTestBot(t, store, api, runner)
+	bot.allowedChannels = makeSet([]string{"C1"})
+
+	bot.HandleMessage(context.Background(), messageReply("U2", "200.2", "not subscribed"))
+
+	if store.claimCalls != 0 || runner.calls != 0 || len(api.calls) != 0 || api.threadCalls != 0 || api.reactionCalls != 0 {
+		t.Fatalf("unsubscribed message caused claim=%d runner=%d Slack calls=%d thread reads=%d reaction lookups=%d",
+			store.claimCalls, runner.calls, len(api.calls), api.threadCalls, api.reactionCalls)
+	}
+}
+
+func TestExpiredMessageReplySubscriptionIsDeletedAndIgnored(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	store := &fakeStore{claim: true, subscriptions: map[string]state.Subscription{
+		"C1:100.1": {StartedAt: now.Add(-2 * time.Hour), ExpiresAt: now},
+	}}
+	api := &fakeSlack{hasReaction: true}
+	runner := &fakeRunner{}
+	bot := newTestBot(t, store, api, runner)
+	bot.allowedChannels = makeSet([]string{"C1"})
+	bot.now = func() time.Time { return now }
+
+	bot.HandleMessage(context.Background(), messageReply("U2", "200.2", "expired"))
+
+	if !reflect.DeepEqual(store.subscriptionDeletes, []string{"C1:100.1"}) {
+		t.Fatalf("subscription deletes = %v, want expired thread", store.subscriptionDeletes)
+	}
+	if _, ok := store.GetSubscription("C1:100.1"); ok {
+		t.Fatal("expired subscription still exists")
+	}
+	if store.claimCalls != 0 || runner.calls != 0 || len(api.calls) != 0 || api.threadCalls != 0 || api.reactionCalls != 0 {
+		t.Fatalf("expired message caused claim=%d runner=%d Slack calls=%d thread reads=%d reaction lookups=%d",
+			store.claimCalls, runner.calls, len(api.calls), api.threadCalls, api.reactionCalls)
+	}
+}
+
+type renewalInterleavingStore struct {
+	*state.Store
+	expiryCheckStarted chan struct{}
+	continueCheck      chan struct{}
+}
+
+func (s *renewalInterleavingStore) DeleteSubscriptionIfExpired(key string, now time.Time) (bool, error) {
+	close(s.expiryCheckStarted)
+	<-s.continueCheck
+	return s.Store.DeleteSubscriptionIfExpired(key, now)
+}
+
+func TestMessageReplyExpiryCheckDoesNotDeleteConcurrentRenewal(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	stateStore, err := state.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore() error = %v, want nil", err)
+	}
+	const subscriptionKey = "C1:100.1"
+	if err := stateStore.SetSubscription(subscriptionKey, now.Add(-2*time.Hour), now); err != nil {
+		t.Fatalf("SetSubscription() expired setup error = %v, want nil", err)
+	}
+	store := &renewalInterleavingStore{
+		Store:              stateStore,
+		expiryCheckStarted: make(chan struct{}),
+		continueCheck:      make(chan struct{}),
+	}
+	defer func() {
+		select {
+		case <-store.continueCheck:
+		default:
+			close(store.continueCheck)
+		}
+	}()
+	runner := successfulPlanRunner()
+	bot := New(&fakeSlack{}, store, runner, Config{
+		AllowedChannelIDs: []string{"C1"},
+		WorkspaceDir:      "/repo/workspace",
+		MemoryDir:         filepath.Join(t.TempDir(), "memory"),
+		CodexTimeout:      time.Minute,
+		BotUserID:         "UBOT",
+	}, nil)
+	bot.now = func() time.Time { return now }
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		bot.HandleMessage(context.Background(), messageReply("U2", "200.2", "renewed reply"))
+	}()
+	select {
+	case <-store.expiryCheckStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("message handler did not enter atomic expiry check")
+	}
+	renewed := state.Subscription{StartedAt: now, ExpiresAt: now.Add(time.Hour)}
+	if err := stateStore.SetSubscription(subscriptionKey, renewed.StartedAt, renewed.ExpiresAt); err != nil {
+		t.Fatalf("SetSubscription() renewal error = %v, want nil", err)
+	}
+	close(store.continueCheck)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("message handler did not finish after concurrent renewal")
+	}
+
+	if got, ok := stateStore.GetSubscription(subscriptionKey); !ok || got != renewed {
+		t.Fatalf("subscription after interleaved renewal = (%+v, %v), want (%+v, true)", got, ok, renewed)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls after renewal = %d, want 1 for now-active subscription", runner.calls)
+	}
+}
+
+func TestDuplicateSubscribedMessageReplyIsSkippedWithoutSlackCalls(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	store := &fakeStore{claim: false}
+	api := &fakeSlack{hasReaction: true}
+	runner := &fakeRunner{}
+	bot := newTestBot(t, store, api, runner)
+	configureActiveSubscription(bot, store, now)
+
+	bot.HandleMessage(context.Background(), messageReply("U2", "200.2", "duplicate"))
+
+	if store.claimCalls != 1 || runner.calls != 0 || len(api.calls) != 0 || api.threadCalls != 0 || api.reactionCalls != 0 {
+		t.Fatalf("duplicate message caused claim=%d runner=%d Slack calls=%d thread reads=%d reaction lookups=%d",
+			store.claimCalls, runner.calls, len(api.calls), api.threadCalls, api.reactionCalls)
+	}
+}
+
+func successfulPlanRunner() *fakeRunner {
+	return &fakeRunner{responses: []runnerResponse{{result: &codex.TurnResult{
+		Completed: true,
+		Messages:  []string{"## 方針\nDone.\n## 作業指示\nNONE"},
+	}}}}
 }
 
 func TestFailClosedTransitionsToDoneWithCheckmark(t *testing.T) {
@@ -264,6 +1095,118 @@ func TestFailClosedTransitionsToDoneWithCheckmark(t *testing.T) {
 	}
 }
 
+func TestPlanSlackOutputsSanitizeForbiddenUserMemory(t *testing.T) {
+	tests := []struct {
+		name     string
+		planText string
+		want     string
+	}{
+		{
+			name:     "successful NONE policy",
+			planText: "## 方針\nNo work needed.\n## 作業指示\nNONE\n## ユーザーメモリ追記\nprivate plan memory",
+			want:     "No work needed.",
+		},
+		{
+			name:     "parse fail-closed",
+			planText: "unstructured plan ``` ## ユーザーメモリ追記 private plan memory",
+			want:     "unstructured plan ```",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{claim: true}
+			api := &fakeSlack{}
+			runner := &fakeRunner{responses: []runnerResponse{
+				{result: &codex.TurnResult{
+					Completed: true,
+					Messages:  []string{test.planText},
+				}},
+				{result: &codex.TurnResult{Completed: true, Messages: []string{"Work completed."}}},
+			}}
+
+			newTestBot(t, store, api, runner).HandleMention(context.Background(), mention())
+
+			posts := strings.Join(api.postTexts, "|")
+			if !strings.Contains(posts, test.want) {
+				t.Fatalf("posts = %q, want preserved output %q", posts, test.want)
+			}
+			for _, forbidden := range []string{"## ユーザーメモリ追記", "private plan memory"} {
+				if strings.Contains(posts, forbidden) {
+					t.Fatalf("posts = %q, must not expose %q", posts, forbidden)
+				}
+			}
+		})
+	}
+}
+
+func TestNormalPlanSanitizesForbiddenUserMemoryBeforeWork(t *testing.T) {
+	store := &fakeStore{claim: true}
+	api := &fakeSlack{}
+	runner := &fakeRunner{responses: []runnerResponse{
+		{result: &codex.TurnResult{Completed: true, Messages: []string{
+			"## 方針\nImplement safely.\n## 作業指示\nMake the change. ## ユーザーメモリ追記 private plan memory",
+		}}},
+		{result: &codex.TurnResult{Completed: true, Messages: []string{"Work completed."}}},
+	}}
+
+	newTestBot(t, store, api, runner).HandleMention(context.Background(), mention())
+
+	if runner.calls != 2 {
+		t.Fatalf("runner calls = %d, want plan and work", runner.calls)
+	}
+	workPrompt := runner.prompts[1]
+	if !strings.Contains(workPrompt, "Make the change.") {
+		t.Fatalf("work prompt = %q, want preserved instruction", workPrompt)
+	}
+	for _, forbidden := range []string{"## ユーザーメモリ追記", "private plan memory"} {
+		if strings.Contains(workPrompt, forbidden) || strings.Contains(strings.Join(api.postTexts, "|"), forbidden) {
+			t.Fatalf("normal plan leaked %q into work or Slack output", forbidden)
+		}
+	}
+}
+
+func TestWorkSlackOutputSanitizesForbiddenUserMemoryAnywhere(t *testing.T) {
+	tests := []struct {
+		name     string
+		workText string
+	}{
+		{
+			name:     "inside fence",
+			workText: "Work completed.\n```text\n## ユーザーメモリ追記\nprivate work memory\n```",
+		},
+		{
+			name:     "inline",
+			workText: "Work completed. ## ユーザーメモリ追記 private work memory",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{claim: true}
+			api := &fakeSlack{}
+			runner := &fakeRunner{responses: []runnerResponse{
+				{result: &codex.TurnResult{Completed: true, Messages: []string{
+					"## 方針\nDo work.\n## 作業指示\nMake a change.",
+				}}},
+				{result: &codex.TurnResult{Completed: true, Messages: []string{test.workText}}},
+			}}
+
+			newTestBot(t, store, api, runner).HandleMention(context.Background(), mention())
+
+			posts := strings.Join(api.postTexts, "|")
+			if !strings.Contains(posts, "Work completed.") {
+				t.Fatalf("posts = %q, want preserved normal work output", posts)
+			}
+			for _, forbidden := range []string{"## ユーザーメモリ追記", "private work memory"} {
+				if strings.Contains(posts, forbidden) {
+					t.Fatalf("posts = %q, must not expose %q", posts, forbidden)
+				}
+			}
+		})
+	}
+}
+
 func TestNoneTransitionsToDoneWithCheckmark(t *testing.T) {
 	store := &fakeStore{claim: true}
 	api := &fakeSlack{}
@@ -291,6 +1234,11 @@ func TestPlanWorkDone(t *testing.T) {
 		}},
 		{result: &codex.TurnResult{Completed: true, Messages: []string{"Work completed."}}},
 	}}
+	runner.onRun = func(call int) {
+		if call == 2 && len(api.postTexts) != 0 {
+			t.Fatalf("posts before work started = %q, want none", api.postTexts)
+		}
+	}
 	newTestBot(t, store, api, runner).HandleMention(context.Background(), mention())
 	assertTransitions(t, store.transitions, [][2]state.State{
 		{state.Received, state.Planning},
@@ -301,7 +1249,7 @@ func TestPlanWorkDone(t *testing.T) {
 	if runner.calls != 2 {
 		t.Fatalf("runner calls = %d, want 2", runner.calls)
 	}
-	if got := strings.Join(api.postTexts, "|"); got != "Implement safely.|Work completed." {
+	if got := strings.Join(api.postTexts, "|"); got != "Work completed." {
 		t.Fatalf("posts = %q", got)
 	}
 	if runner.roots[0] != nil || runner.roots[1] != nil {
@@ -311,7 +1259,7 @@ func TestPlanWorkDone(t *testing.T) {
 	assertFinalReactionOrder(t, api.calls, "white_check_mark")
 }
 
-func TestPlanSessionsAreSeparatedByUser(t *testing.T) {
+func TestPlanSessionsAreSharedBySlackThread(t *testing.T) {
 	store := &fakeStore{claim: true}
 	runner := &fakeRunner{responses: []runnerResponse{
 		{result: &codex.TurnResult{Completed: true, Messages: []string{"## 方針\nDone.\n## 作業指示\nNONE"}}},
@@ -324,12 +1272,15 @@ func TestPlanSessionsAreSeparatedByUser(t *testing.T) {
 		User: "U2", Channel: "C1", TimeStamp: "200.2", ThreadTimeStamp: "100.1", Text: "<@UBOT> do it",
 	})
 
-	want := []string{"v2:C1:100.1:U1", "v2:C1:100.1:U2"}
+	want := []string{"v3:C1:100.1", "v3:C1:100.1"}
 	if !reflect.DeepEqual(store.threadKeys, want) {
 		t.Fatalf("thread keys = %v, want %v", store.threadKeys, want)
 	}
-	if len(store.threadIDs) != 2 {
-		t.Fatalf("stored thread keys = %v, want two user-specific sessions", store.threadIDs)
+	if len(store.threadIDs) != 1 {
+		t.Fatalf("stored thread keys = %v, want one shared session", store.threadIDs)
+	}
+	if got := runner.threadIDs; !reflect.DeepEqual(got, []string{"", "plan-thread"}) {
+		t.Fatalf("runner thread IDs = %v, want second user to resume shared session", got)
 	}
 }
 
@@ -371,7 +1322,7 @@ func TestFirstThreadMentionReceivesEarlierSlackMessages(t *testing.T) {
 func TestExistingPlanSessionSkipsSlackThreadFetch(t *testing.T) {
 	store := &fakeStore{
 		claim:     true,
-		threadIDs: map[string]string{"v2:C1:100.1:U1": "existing-thread"},
+		threadIDs: map[string]string{"v3:C1:100.1": "existing-thread"},
 	}
 	api := &fakeSlack{threadErr: errors.New("must not be called")}
 	runner := &fakeRunner{responses: []runnerResponse{{result: &codex.TurnResult{
@@ -431,7 +1382,7 @@ func TestFormatThreadContextCapsRunesAndKeepsEnds(t *testing.T) {
 	}
 }
 
-func TestKeepStatusRetriesThenRefreshes(t *testing.T) {
+func TestKeepStatusRefreshesUntilStopped(t *testing.T) {
 	api := &fakeSlack{}
 	bot := newTestBot(t, &fakeStore{}, api, &fakeRunner{})
 	sleepCalls := make(chan time.Duration)
@@ -451,20 +1402,16 @@ func TestKeepStatusRetriesThenRefreshes(t *testing.T) {
 	}
 
 	stop := bot.keepStatus(context.Background(), "C1", "100.1", workingStatus)
-	if got := receiveDuration(t, sleepCalls); got != statusRetryDelay {
-		t.Fatalf("first status delay = %v, want %v", got, statusRetryDelay)
+	if got := receiveDuration(t, sleepCalls); got != statusRefreshDelay {
+		t.Fatalf("first status delay = %v, want %v", got, statusRefreshDelay)
 	}
 	releaseSleep <- struct{}{}
 	if got := receiveDuration(t, sleepCalls); got != statusRefreshDelay {
 		t.Fatalf("second status delay = %v, want %v", got, statusRefreshDelay)
 	}
-	releaseSleep <- struct{}{}
-	if got := receiveDuration(t, sleepCalls); got != statusRefreshDelay {
-		t.Fatalf("third status delay = %v, want %v", got, statusRefreshDelay)
-	}
 	stop()
 
-	assertStatusSequence(t, api.calls, []string{workingStatus, workingStatus, workingStatus})
+	assertStatusSequence(t, api.calls, []string{workingStatus, workingStatus})
 }
 
 func TestWorkTurnReceivesWritableRootsAndPlanTurnDoesNot(t *testing.T) {
@@ -499,8 +1446,8 @@ func TestWorkTurnReceivesWritableRootsAndPlanTurnDoesNot(t *testing.T) {
 	if got := runner.cwds[0]; got != "/repo/workspace" {
 		t.Errorf("plan turn cwd = %q, want isolated workspace", got)
 	}
-	if got := runner.sandboxes[0]; got != "read-only" {
-		t.Errorf("plan turn sandbox = %q, want read-only", got)
+	if got := runner.sandboxes[0]; got != "read-only-network" {
+		t.Errorf("plan turn sandbox = %q, want read-only-network", got)
 	}
 	want := []string{"/extra/one", "/extra/two"}
 	if !reflect.DeepEqual(runner.roots[1], want) {
@@ -524,11 +1471,10 @@ func TestPlanPromptInjectsMemoryContent(t *testing.T) {
 		text  string
 	}{
 		{scope: memory.ScopeGlobal, text: "全体の学び"},
-		{scope: memory.ScopeUser, text: "ユーザーの好み"},
 		{scope: memory.ScopeChannel, text: "チャンネルの慣習"},
 	}
 	for _, entry := range entries {
-		if _, err := memory.AppendScoped(bot.config.MemoryDir, entry.scope, "U1", "C1", entry.text); err != nil {
+		if _, err := memory.AppendScoped(bot.config.MemoryDir, entry.scope, "C1", entry.text); err != nil {
 			t.Fatalf("append %s memory: %v", entry.scope, err)
 		}
 	}
@@ -539,12 +1485,14 @@ func TestPlanPromptInjectsMemoryContent(t *testing.T) {
 	prompt := runner.prompts[0]
 	for _, want := range []string{
 		"<global_memory>", "全体の学び", "</global_memory>",
-		"<user_memory>", "ユーザーの好み", "</user_memory>",
 		"<channel_memory>", "チャンネルの慣習", "</channel_memory>",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("plan prompt does not contain %q", want)
 		}
+	}
+	if strings.Contains(prompt, "user_memory") {
+		t.Error("plan prompt must omit user memory")
 	}
 	if strings.Contains(prompt, "MEMORY.md") {
 		t.Error("plan prompt should inject memory content, not the file path")
@@ -564,7 +1512,6 @@ func TestWorkMemoryAppendIsWrittenByBot(t *testing.T) {
 			Messages: []string{strings.Join([]string{
 				"Work completed.",
 				"## 全体メモリ追記", "ビルドは mise run build を使う",
-				"## ユーザーメモリ追記", "簡潔な日本語を好む",
 				"## チャンネルメモリ追記", "動作確認用チャンネル",
 			}, "\n")},
 		}},
@@ -579,7 +1526,6 @@ func TestWorkMemoryAppendIsWrittenByBot(t *testing.T) {
 		want string
 	}{
 		{path: filepath.Join(bot.config.MemoryDir, "MEMORY.md"), want: "ビルドは mise run build を使う"},
-		{path: filepath.Join(bot.config.MemoryDir, "users", "U1", "MEMORY.md"), want: "簡潔な日本語を好む"},
 		{path: filepath.Join(bot.config.MemoryDir, "channels", "C1", "MEMORY.md"), want: "動作確認用チャンネル"},
 	}
 	for _, file := range files {
@@ -592,17 +1538,17 @@ func TestWorkMemoryAppendIsWrittenByBot(t *testing.T) {
 		}
 	}
 	posts := strings.Join(api.postTexts, "|")
-	if !strings.Contains(posts, "Work completed.") || !strings.Contains(posts, "全体・ユーザー・チャンネルメモリを更新しました") {
+	if !strings.Contains(posts, "Work completed.") || !strings.Contains(posts, "全体・チャンネルメモリを更新しました") {
 		t.Fatalf("posts = %q, want work result and memory notification", posts)
 	}
-	for _, private := range []string{"ビルドは mise run build を使う", "簡潔な日本語を好む", "動作確認用チャンネル", "## ユーザーメモリ追記"} {
+	for _, private := range []string{"ビルドは mise run build を使う", "動作確認用チャンネル"} {
 		if strings.Contains(posts, private) {
 			t.Fatalf("posts = %q, should not expose memory content %q", posts, private)
 		}
 	}
 }
 
-func TestMalformedMemoryOutputIsNotPostedOrWritten(t *testing.T) {
+func TestUserMemoryOutputIsNotAccepted(t *testing.T) {
 	store := &fakeStore{claim: true}
 	api := &fakeSlack{}
 	runner := &fakeRunner{responses: []runnerResponse{
@@ -610,22 +1556,25 @@ func TestMalformedMemoryOutputIsNotPostedOrWritten(t *testing.T) {
 			Completed: true,
 			Messages:  []string{"## 方針\nDo work.\n## 作業指示\nMake a change."},
 		}},
-		{result: &codex.TurnResult{
-			Completed: true,
-			Messages: []string{
-				"Work completed.\n## ユーザーメモリ追記\nprivate one\n## ユーザーメモリ追記\nprivate two",
-			},
-		}},
+		{result: &codex.TurnResult{Completed: true, Messages: []string{
+			"Work completed.\n## ユーザーメモリ追記\nprivate memory",
+		}}},
 	}}
 	bot := newTestBot(t, store, api, runner)
 	bot.HandleMention(context.Background(), mention())
 
 	posts := strings.Join(api.postTexts, "|")
-	if !strings.Contains(posts, "Work completed.") || strings.Contains(posts, "private") {
-		t.Fatalf("posts = %q, malformed private memory must be stripped", posts)
+	if !strings.Contains(posts, "Work completed.") || strings.Contains(posts, "メモリを更新しました") || strings.Contains(posts, "## ユーザーメモリ追記") || strings.Contains(posts, "private memory") {
+		t.Fatalf("posts = %q, want work result", posts)
 	}
-	if _, err := os.Stat(filepath.Join(bot.config.MemoryDir, "users", "U1", "MEMORY.md")); !os.IsNotExist(err) {
-		t.Fatalf("malformed memory should not be written, stat error = %v", err)
+	for _, path := range []string{
+		filepath.Join(bot.config.MemoryDir, "MEMORY.md"),
+		filepath.Join(bot.config.MemoryDir, "users", "U1", "MEMORY.md"),
+		filepath.Join(bot.config.MemoryDir, "channels", "C1", "MEMORY.md"),
+	} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("user memory output should not be written to %s, stat error = %v", path, err)
+		}
 	}
 }
 
@@ -671,6 +1620,16 @@ func (s *looseStore) SetThread(key, threadID string) error {
 	defer s.mu.Unlock()
 	s.threads[key] = threadID
 	return nil
+}
+
+func (s *looseStore) GetSubscription(string) (state.Subscription, bool) {
+	return state.Subscription{}, false
+}
+
+func (s *looseStore) SetSubscription(string, time.Time, time.Time) error { return nil }
+
+func (s *looseStore) DeleteSubscriptionIfExpired(string, time.Time) (bool, error) {
+	return false, nil
 }
 
 // gatedRunner holds the work turn open until release is closed so a test can

@@ -1,4 +1,5 @@
 .env
+/scripts/
 /ebiii
 *.exe
 *.test
@@ -6,3 +7,9 @@
 
 # Runtime data (workspace, memory, playbooks, state)
 /data/
+
+# Local GitHub App authentication workflow
+/.agents/skills/github-app-repositories/
+
+.codex/
+docs/

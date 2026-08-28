@@ -3,6 +3,7 @@ package slackbot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -28,9 +29,9 @@ const (
 	planFailureMessage    = "⚠️ 方針の検討または投稿に失敗しました。もう一度 mention してください。"
 	threadFailureMessage  = "⚠️ スレッドの読み込みに失敗したため、作業は開始していません。もう一度 mention してください。"
 	workFailureMessage    = "⚠️ 作業が完了したことを確認できませんでした。状況を確認し、新しい mention で依頼し直してください。"
+	forbiddenMessage      = "403 forbidden. %s に確認してください。"
 	planningStatus        = "が方針を考えています…"
 	workingStatus         = "が作業を進めています…"
-	statusRetryDelay      = time.Second
 	statusRefreshDelay    = 80 * time.Second
 )
 
@@ -39,6 +40,7 @@ type SlackAPI interface {
 	PostMessage(ctx context.Context, channel, threadTS, text string) (string, error)
 	GetThreadMessages(ctx context.Context, channel, threadTS, latest string) ([]ThreadMessage, error)
 	SetStatus(ctx context.Context, channel, threadTS, status string) error
+	HasReaction(ctx context.Context, channel, timestamp, reaction string) (bool, error)
 	AddReaction(ctx context.Context, channel, timestamp, name string) error
 	RemoveReaction(ctx context.Context, channel, timestamp, name string) error
 }
@@ -56,6 +58,9 @@ type Store interface {
 	Transition(eventKey string, from, to state.State) error
 	GetThread(threadKey string) (string, bool)
 	SetThread(threadKey, threadID string) error
+	GetSubscription(threadKey string) (state.Subscription, bool)
+	SetSubscription(threadKey string, startedAt, expiresAt time.Time) error
+	DeleteSubscriptionIfExpired(threadKey string, now time.Time) (bool, error)
 }
 
 // Runner executes one Codex turn.
@@ -65,12 +70,16 @@ type Runner interface {
 
 // Config contains paths, allowlists, and timeout settings needed by Bot.
 type Config struct {
-	AllowedUserIDs    []string
-	AllowedChannelIDs []string
-	WorkspaceDir      string
-	MemoryDir         string
-	CodexTimeout      time.Duration
-	BotUserID         string
+	AllowedUserIDs             []string
+	AllowedChannelIDs          []string
+	AllowWorkflows             bool
+	AdminUserID                string
+	WorkspaceDir               string
+	MemoryDir                  string
+	CodexTimeout               time.Duration
+	ThreadSubscriptionReaction string
+	ThreadSubscriptionTTL      time.Duration
+	BotUserID                  string
 	// WritableRoots are extra directories the work turn may write to.
 	WritableRoots []string
 }
@@ -89,7 +98,25 @@ type Bot struct {
 	memoryMu        sync.RWMutex
 	threadMu        sync.Mutex
 	threadLocks     map[string]*sync.Mutex
+	now             func() time.Time
 	sleep           func(context.Context, time.Duration) error
+}
+
+type triggerSource uint8
+
+const (
+	mentionTrigger triggerSource = iota
+	messageTrigger
+)
+
+type processingTrigger struct {
+	source      triggerSource
+	authorID    string
+	channel     string
+	timestamp   string
+	threadTS    string
+	message     string
+	threadReply bool
 }
 
 // New constructs a Bot.
@@ -104,6 +131,7 @@ func New(api SlackAPI, store Store, runner Runner, config Config, playbooks []pl
 		allowedUsers:    makeSet(config.AllowedUserIDs),
 		allowedChannels: makeSet(config.AllowedChannelIDs),
 		threadLocks:     make(map[string]*sync.Mutex),
+		now:             time.Now,
 		sleep:           sleepContext,
 	}
 	return b
@@ -111,39 +139,112 @@ func New(api SlackAPI, store Store, runner Runner, config Config, playbooks []pl
 
 // HandleMention filters and processes one already-acknowledged app mention.
 func (b *Bot) HandleMention(ctx context.Context, event *slackevents.AppMentionEvent) {
-	if event == nil || event.BotID != "" || event.Edited != nil || event.User == b.config.BotUserID {
+	b.handleMention(ctx, event, "")
+}
+
+func (b *Bot) handleMention(ctx context.Context, event *slackevents.AppMentionEvent, workflowID string) {
+	if event == nil || event.Edited != nil || event.User == b.config.BotUserID {
 		return
 	}
-	message := stripBotMention(event.Text, b.config.BotUserID)
-	if message == "" {
-		return
-	}
-	if _, ok := b.allowedUsers[event.User]; !ok {
-		log.Printf("slackbot: rejecting user %q", event.User)
+	if event.BotID == "" {
+		if _, ok := b.allowedUsers[event.User]; !ok {
+			log.Printf("slackbot: rejecting user %q", event.User)
+			b.forbidden(ctx, event)
+			return
+		}
+	} else if !b.config.AllowWorkflows || !validWorkflowID(workflowID) {
+		log.Printf("slackbot: rejecting bot %q with workflow %q", event.BotID, workflowID)
+		b.forbidden(ctx, event)
 		return
 	}
 	if len(b.allowedChannels) > 0 {
 		if _, ok := b.allowedChannels[event.Channel]; !ok {
 			log.Printf("slackbot: rejecting channel %q", event.Channel)
+			b.forbidden(ctx, event)
 			return
 		}
 	}
-
-	eventKey := event.Channel + ":" + event.TimeStamp
 	threadTS := event.ThreadTimeStamp
 	if threadTS == "" {
 		threadTS = event.TimeStamp
 	}
-	// Include the user so a shared Slack thread cannot resume a Codex session
-	// containing another user's personalized memory and conversation context.
-	// v2 prevents sessions created before memory isolation from being resumed:
-	// those sessions used EBIII_HOME (which contains memory) as their cwd.
-	threadKey := "v2:" + event.Channel + ":" + threadTS + ":" + event.User
+
+	message := stripBotMention(event.Text, b.config.BotUserID)
+	if message == "" {
+		return
+	}
+	b.processTrigger(ctx, processingTrigger{
+		source:      mentionTrigger,
+		authorID:    event.User,
+		channel:     event.Channel,
+		timestamp:   event.TimeStamp,
+		threadTS:    threadTS,
+		message:     message,
+		threadReply: event.ThreadTimeStamp != "",
+	})
+}
+
+// HandleMessage filters and processes one already-acknowledged ordinary
+// public-channel message event from an active subscribed thread.
+func (b *Bot) HandleMessage(ctx context.Context, event *slackevents.MessageEvent) {
+	if event == nil ||
+		event.ChannelType != "channel" ||
+		event.ThreadTimeStamp == "" ||
+		event.User == "" ||
+		event.User == b.config.BotUserID ||
+		event.BotID != "" ||
+		(event.SubType != "" && event.SubType != slack.MsgSubTypeThreadBroadcast) ||
+		event.IsEdited() ||
+		event.DeletedTimeStamp != "" ||
+		strings.TrimSpace(event.Text) == "" {
+		return
+	}
+	if _, ok := b.allowedChannels[event.Channel]; !ok {
+		return
+	}
+	if b.config.BotUserID != "" && strings.Contains(event.Text, "<@"+b.config.BotUserID+">") {
+		return
+	}
+
+	subscriptionKey := event.Channel + ":" + event.ThreadTimeStamp
+	now := b.now()
+	deleted, err := b.store.DeleteSubscriptionIfExpired(subscriptionKey, now)
+	if err != nil {
+		log.Printf("slackbot: delete expired subscription %q: %v", subscriptionKey, err)
+		return
+	}
+	if deleted {
+		return
+	}
+	subscription, ok := b.store.GetSubscription(subscriptionKey)
+	if !ok || !subscription.ExpiresAt.After(now) {
+		return
+	}
+
+	b.processTrigger(ctx, processingTrigger{
+		source:      messageTrigger,
+		authorID:    event.User,
+		channel:     event.Channel,
+		timestamp:   event.TimeStamp,
+		threadTS:    event.ThreadTimeStamp,
+		message:     event.Text,
+		threadReply: true,
+	})
+}
+
+func (b *Bot) processTrigger(ctx context.Context, trigger processingTrigger) {
+	channel := trigger.channel
+	timestamp := trigger.timestamp
+	threadTS := trigger.threadTS
+
+	eventKey := channel + ":" + timestamp
+	// v3 prevents sessions created before thread sharing from being resumed.
+	threadKey := "v3:" + channel + ":" + threadTS
 
 	claimed, err := b.store.ClaimEvent(eventKey)
 	if err != nil {
 		log.Printf("slackbot: claim %q: %v", eventKey, err)
-		if postErr := b.post(ctx, event.Channel, threadTS, claimFailureMessage); postErr != nil {
+		if postErr := b.post(ctx, channel, threadTS, claimFailureMessage); postErr != nil {
 			log.Printf("slackbot: post claim failure: %v", postErr)
 		}
 		return
@@ -151,41 +252,49 @@ func (b *Bot) HandleMention(ctx context.Context, event *slackevents.AppMentionEv
 	if !claimed {
 		return
 	}
-	b.addReaction(ctx, event.Channel, event.TimeStamp, "eyes")
+	if trigger.source == mentionTrigger {
+		b.startThreadSubscription(ctx, channel, threadTS)
+	}
+	b.addReaction(ctx, channel, timestamp, "eyes")
 
 	if err := b.store.Transition(eventKey, state.Received, state.Planning); err != nil {
 		log.Printf("slackbot: start planning %q: %v", eventKey, err)
-		if postErr := b.post(ctx, event.Channel, threadTS, planFailureMessage); postErr != nil {
+		if postErr := b.post(ctx, channel, threadTS, planFailureMessage); postErr != nil {
 			log.Printf("slackbot: post planning transition failure %q: %v", eventKey, postErr)
 		}
-		b.finalReaction(ctx, event.Channel, event.TimeStamp, false)
+		b.finalReaction(ctx, channel, timestamp, false)
 		return
 	}
-	b.setStatus(ctx, event.Channel, threadTS, planningStatus)
-	defer b.clearStatus(ctx, event.Channel, threadTS)
+	b.setStatus(ctx, channel, threadTS, planningStatus)
+	defer b.clearStatus(ctx, channel, threadTS)
 
 	lock := b.threadLock(threadKey)
 	lock.Lock()
 	threadID, hasThread := b.store.GetThread(threadKey)
 	var slackThread string
-	if !hasThread && event.ThreadTimeStamp != "" {
-		threadMessages, err := b.api.GetThreadMessages(ctx, event.Channel, threadTS, event.TimeStamp)
+	if !hasThread && trigger.threadReply {
+		threadMessages, err := b.api.GetThreadMessages(ctx, channel, threadTS, timestamp)
 		if err != nil {
 			lock.Unlock()
 			log.Printf("slackbot: read thread context %q: %v", eventKey, err)
-			b.fail(ctx, eventKey, state.Planning, state.Failed, event.Channel, threadTS, event.TimeStamp, threadFailureMessage)
+			b.fail(ctx, eventKey, state.Planning, state.Failed, channel, threadTS, timestamp, threadFailureMessage)
 			return
 		}
-		slackThread = formatThreadContext(threadMessages, event.TimeStamp)
+		slackThread = formatThreadContext(threadMessages, timestamp)
 	}
 	b.memoryMu.RLock()
-	memoryContext, memErr := memory.ReadContext(b.config.MemoryDir, event.User, event.Channel)
+	memoryContext, memErr := memory.ReadContext(b.config.MemoryDir, channel)
 	b.memoryMu.RUnlock()
 	if memErr != nil {
 		log.Printf("slackbot: read memory: %v", memErr)
 	}
-	planPrompt := prompt.BuildPlanPrompt(memoryContext, b.playbooks, slackThread, message)
-	planResult, runErr := b.runTurn(ctx, threadID, "read-only", b.config.WorkspaceDir, nil, planPrompt, func(id string) error {
+	var planPrompt string
+	if trigger.source == messageTrigger {
+		planPrompt = prompt.BuildMessagePlanPrompt(memoryContext, b.playbooks, slackThread, trigger.authorID, trigger.message)
+	} else {
+		planPrompt = prompt.BuildPlanPrompt(memoryContext, b.playbooks, slackThread, trigger.message)
+	}
+	planResult, runErr := b.runTurn(ctx, threadID, "read-only-network", b.config.WorkspaceDir, nil, planPrompt, func(id string) error {
 		if err := b.store.SetThread(threadKey, id); err != nil {
 			return fmt.Errorf("persist plan thread: %w", err)
 		}
@@ -199,49 +308,48 @@ func (b *Bot) HandleMention(ctx context.Context, event *slackevents.AppMentionEv
 		} else if planResult != nil {
 			log.Printf("slackbot: plan turn %q incomplete: %s", eventKey, planResult.Err)
 		}
-		b.fail(ctx, eventKey, state.Planning, state.Failed, event.Channel, threadTS, event.TimeStamp, planFailureMessage)
+		b.fail(ctx, eventKey, state.Planning, state.Failed, channel, threadTS, timestamp, planFailureMessage)
 		return
 	}
 	if len(planResult.Messages) == 0 {
-		b.finishFailClosed(ctx, eventKey, event.Channel, threadTS, event.TimeStamp, failClosedMessage)
+		b.finishFailClosed(ctx, eventKey, channel, threadTS, timestamp, failClosedMessage)
 		return
 	}
 
-	planText := planResult.Messages[len(planResult.Messages)-1]
+	planText := codex.SanitizeSlackOutput(planResult.Messages[len(planResult.Messages)-1])
 	policy, instruction, err := codex.ParsePlan(planText)
 	if err != nil {
 		log.Printf("slackbot: parse plan %q: %v", eventKey, err)
-		b.finishFailClosed(ctx, eventKey, event.Channel, threadTS, event.TimeStamp, planText+"\n\n"+failClosedMessage)
-		return
-	}
-	if err := b.post(ctx, event.Channel, threadTS, policy); err != nil {
-		log.Printf("slackbot: post policy %q: %v", eventKey, err)
-		b.fail(ctx, eventKey, state.Planning, state.Failed, event.Channel, threadTS, event.TimeStamp, planFailureMessage)
+		b.finishFailClosed(ctx, eventKey, channel, threadTS, timestamp, planText+"\n\n"+failClosedMessage)
 		return
 	}
 	if err := b.store.Transition(eventKey, state.Planning, state.PlanPosted); err != nil {
 		log.Printf("slackbot: persist posted plan %q: %v", eventKey, err)
-		b.fail(ctx, eventKey, state.Planning, state.Failed, event.Channel, threadTS, event.TimeStamp, planFailureMessage)
+		b.fail(ctx, eventKey, state.Planning, state.Failed, channel, threadTS, timestamp, planFailureMessage)
 		return
 	}
 	if instruction == "" {
-		if err := b.store.Transition(eventKey, state.PlanPosted, state.Done); err != nil {
-			log.Printf("slackbot: finish NONE %q: %v", eventKey, err)
-			b.fail(ctx, eventKey, state.PlanPosted, state.Failed, event.Channel, threadTS, event.TimeStamp, planFailureMessage)
+		if err := b.post(ctx, channel, threadTS, policy); err != nil {
+			log.Printf("slackbot: post policy %q: %v", eventKey, err)
+			b.fail(ctx, eventKey, state.PlanPosted, state.Failed, channel, threadTS, timestamp, planFailureMessage)
 			return
 		}
-		b.finalReaction(ctx, event.Channel, event.TimeStamp, true)
+		if err := b.store.Transition(eventKey, state.PlanPosted, state.Done); err != nil {
+			log.Printf("slackbot: finish NONE %q: %v", eventKey, err)
+			b.fail(ctx, eventKey, state.PlanPosted, state.Failed, channel, threadTS, timestamp, planFailureMessage)
+			return
+		}
+		b.finalReaction(ctx, channel, timestamp, true)
 		return
 	}
 	if err := b.store.Transition(eventKey, state.PlanPosted, state.Working); err != nil {
 		log.Printf("slackbot: start work %q: %v", eventKey, err)
-		b.fail(ctx, eventKey, state.PlanPosted, state.Failed, event.Channel, threadTS, event.TimeStamp, planFailureMessage)
+		b.fail(ctx, eventKey, state.PlanPosted, state.Failed, channel, threadTS, timestamp, planFailureMessage)
 		return
 	}
-	// Posting the plan clears Slack's status automatically. Keep reapplying the
-	// work status so a delayed auto-clear cannot erase it and Slack's two-minute
-	// status timeout cannot expire during a long-running work turn.
-	stopWorkingStatus := b.keepStatus(ctx, event.Channel, threadTS, workingStatus)
+	// A work plan is intentionally not posted: Slack would clear the progress
+	// status when processing that reply. Refresh the status until work completes.
+	stopWorkingStatus := b.keepStatus(ctx, channel, threadTS, workingStatus)
 	defer stopWorkingStatus()
 
 	// workMu serializes work turns and the memory append that follows them.
@@ -252,7 +360,7 @@ func (b *Bot) HandleMention(ctx context.Context, event *slackevents.AppMentionEv
 	// contract and the bot writes them.
 	b.workMu.Lock()
 	b.memoryMu.RLock()
-	workMemoryContext, memErr := memory.ReadContext(b.config.MemoryDir, event.User, event.Channel)
+	workMemoryContext, memErr := memory.ReadContext(b.config.MemoryDir, channel)
 	b.memoryMu.RUnlock()
 	if memErr != nil {
 		log.Printf("slackbot: refresh memory before work: %v", memErr)
@@ -264,6 +372,7 @@ func (b *Bot) HandleMention(ctx context.Context, event *slackevents.AppMentionEv
 	if workErr == nil && workResult != nil && workResult.Completed && len(workResult.Messages) > 0 {
 		var memoryOutputValid bool
 		resultText, memoryAppends, memoryOutputValid = codex.SplitMemoryAppends(workResult.Messages[len(workResult.Messages)-1])
+		resultText = codex.SanitizeSlackOutput(resultText)
 		if !memoryOutputValid {
 			log.Printf("slackbot: ignore malformed scoped memory output %q", eventKey)
 		}
@@ -276,7 +385,6 @@ func (b *Bot) HandleMention(ctx context.Context, event *slackevents.AppMentionEv
 			entry string
 		}{
 			{scope: memory.ScopeGlobal, label: "全体", entry: memoryAppends.Global},
-			{scope: memory.ScopeUser, label: "ユーザー", entry: memoryAppends.User},
 			{scope: memory.ScopeChannel, label: "チャンネル", entry: memoryAppends.Channel},
 		}
 		b.memoryMu.Lock()
@@ -285,7 +393,7 @@ func (b *Bot) HandleMention(ctx context.Context, event *slackevents.AppMentionEv
 				continue
 			}
 			written, err := memory.AppendScoped(
-				b.config.MemoryDir, target.scope, event.User, event.Channel, target.entry,
+				b.config.MemoryDir, target.scope, channel, target.entry,
 			)
 			if err != nil {
 				log.Printf("slackbot: append %s memory %q: %v", target.scope, eventKey, err)
@@ -303,7 +411,7 @@ func (b *Bot) HandleMention(ctx context.Context, event *slackevents.AppMentionEv
 		if workErr != nil {
 			log.Printf("slackbot: work turn %q: %v", eventKey, workErr)
 		}
-		b.fail(ctx, eventKey, state.Working, state.Interrupted, event.Channel, threadTS, event.TimeStamp, workFailureMessage)
+		b.fail(ctx, eventKey, state.Working, state.Interrupted, channel, threadTS, timestamp, workFailureMessage)
 		return
 	}
 	if resultText == "" {
@@ -312,17 +420,79 @@ func (b *Bot) HandleMention(ctx context.Context, event *slackevents.AppMentionEv
 	if len(updatedMemoryScopes) > 0 {
 		resultText += "\n\n📝 " + strings.Join(updatedMemoryScopes, "・") + "メモリを更新しました。"
 	}
-	if err := b.post(ctx, event.Channel, threadTS, resultText); err != nil {
+	if err := b.post(ctx, channel, threadTS, resultText); err != nil {
 		log.Printf("slackbot: post work result %q: %v", eventKey, err)
-		b.fail(ctx, eventKey, state.Working, state.Interrupted, event.Channel, threadTS, event.TimeStamp, workFailureMessage)
+		b.fail(ctx, eventKey, state.Working, state.Interrupted, channel, threadTS, timestamp, workFailureMessage)
 		return
 	}
 	if err := b.store.Transition(eventKey, state.Working, state.Done); err != nil {
 		log.Printf("slackbot: finish work %q: %v", eventKey, err)
-		b.fail(ctx, eventKey, state.Working, state.Interrupted, event.Channel, threadTS, event.TimeStamp, workFailureMessage)
+		b.fail(ctx, eventKey, state.Working, state.Interrupted, channel, threadTS, timestamp, workFailureMessage)
 		return
 	}
-	b.finalReaction(ctx, event.Channel, event.TimeStamp, true)
+	b.finalReaction(ctx, channel, timestamp, true)
+}
+
+func (b *Bot) forbidden(ctx context.Context, event *slackevents.AppMentionEvent) {
+	contact := "@seiji"
+	if b.config.AdminUserID != "" {
+		contact = "<@" + b.config.AdminUserID + ">"
+	}
+	threadTS := event.ThreadTimeStamp
+	if threadTS == "" {
+		threadTS = event.TimeStamp
+	}
+	if err := b.post(ctx, event.Channel, threadTS, fmt.Sprintf(forbiddenMessage, contact)); err != nil {
+		log.Printf("slackbot: post forbidden response: %v", err)
+	}
+}
+
+func validWorkflowID(id string) bool {
+	if len(id) <= 2 || !strings.HasPrefix(id, "Wf") {
+		return false
+	}
+	for _, char := range id[2:] {
+		if (char < 'A' || char > 'Z') && (char < '0' || char > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func workflowIDFromPayload(payload json.RawMessage) string {
+	var envelope struct {
+		Event struct {
+			WorkflowID string `json:"workflow_id"`
+		} `json:"event"`
+	}
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		return ""
+	}
+	return envelope.Event.WorkflowID
+}
+
+func (b *Bot) startThreadSubscription(ctx context.Context, channel, threadTS string) {
+	marker := b.config.ThreadSubscriptionReaction
+	if marker == "" {
+		return
+	}
+	var marked bool
+	err := b.retrySlack(ctx, func() error {
+		var err error
+		marked, err = b.api.HasReaction(ctx, channel, threadTS, marker)
+		return err
+	})
+	if err != nil {
+		log.Printf("slackbot: read subscription marker %q: %v", channel+":"+threadTS, err)
+		return
+	}
+	if !marked {
+		return
+	}
+	now := b.now()
+	if err := b.store.SetSubscription(channel+":"+threadTS, now, now.Add(b.config.ThreadSubscriptionTTL)); err != nil {
+		log.Printf("slackbot: save subscription %q: %v", channel+":"+threadTS, err)
+	}
 }
 
 func (b *Bot) runTurn(ctx context.Context, threadID, sandbox, cwd string, roots []string, text string, callback func(string) error) (*codex.TurnResult, error) {
@@ -388,12 +558,6 @@ func (b *Bot) keepStatus(ctx context.Context, channel, threadTS, status string) 
 	b.setStatus(ctx, channel, threadTS, status)
 	go func() {
 		defer close(done)
-		// Slack clears the previous status when it processes the plan reply.
-		// Reapply once shortly afterward to recover from that asynchronous clear.
-		if err := b.sleep(statusCtx, statusRetryDelay); err != nil {
-			return
-		}
-		b.setStatus(statusCtx, channel, threadTS, status)
 		for {
 			if err := b.sleep(statusCtx, statusRefreshDelay); err != nil {
 				return
@@ -420,21 +584,27 @@ func (b *Bot) clearStatus(ctx context.Context, channel, threadTS string) {
 
 func (b *Bot) post(ctx context.Context, channel, threadTS, text string) error {
 	for _, chunk := range splitMessage(text, maxSlackMessageRunes) {
-		if _, err := b.api.PostMessage(ctx, channel, threadTS, chunk); err != nil {
-			if !retryable(err) {
-				return fmt.Errorf("post Slack message: %w", err)
-			}
-			if rateLimited, ok := errors.AsType[*slack.RateLimitedError](err); ok {
-				if err := b.sleep(ctx, rateLimited.RetryAfter); err != nil {
-					return fmt.Errorf("wait for Slack retry: %w", err)
-				}
-			}
-			if _, retryErr := b.api.PostMessage(ctx, channel, threadTS, chunk); retryErr != nil {
-				return fmt.Errorf("retry Slack message: %w", retryErr)
-			}
+		if err := b.retrySlack(ctx, func() error {
+			_, err := b.api.PostMessage(ctx, channel, threadTS, chunk)
+			return err
+		}); err != nil {
+			return fmt.Errorf("post Slack message: %w", err)
 		}
 	}
 	return nil
+}
+
+func (b *Bot) retrySlack(ctx context.Context, operation func() error) error {
+	err := operation()
+	if err == nil || !retryable(err) {
+		return err
+	}
+	if rateLimited, ok := errors.AsType[*slack.RateLimitedError](err); ok {
+		if err := b.sleep(ctx, rateLimited.RetryAfter); err != nil {
+			return fmt.Errorf("wait for Slack retry: %w", err)
+		}
+	}
+	return operation()
 }
 
 func (b *Bot) threadLock(key string) *sync.Mutex {
@@ -569,6 +739,19 @@ func (w *webAPI) SetStatus(ctx context.Context, channel, threadTS, status string
 	})
 }
 
+func (w *webAPI) HasReaction(ctx context.Context, channel, timestamp, reaction string) (bool, error) {
+	reactions, err := w.client.GetReactionsContext(ctx, slack.ItemRef{Channel: channel, Timestamp: timestamp}, slack.GetReactionsParameters{})
+	if err != nil {
+		return false, err
+	}
+	for _, itemReaction := range reactions {
+		if itemReaction.Name == reaction {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (w *webAPI) AddReaction(ctx context.Context, channel, timestamp, name string) error {
 	return w.client.AddReactionContext(ctx, name, slack.ItemRef{Channel: channel, Timestamp: timestamp})
 }
@@ -578,7 +761,7 @@ func (w *webAPI) RemoveReaction(ctx context.Context, channel, timestamp, name st
 }
 
 // RunSocketMode connects a Bot to Slack Socket Mode. It acknowledges every
-// envelope before dispatching app mentions to separate goroutines.
+// envelope before dispatching app mentions and ordinary messages separately.
 func RunSocketMode(acceptCtx, turnCtx context.Context, botToken, appToken string, bot *Bot, wg *sync.WaitGroup) error {
 	client := slack.New(botToken, slack.OptionAppLevelToken(appToken))
 	auth, err := client.AuthTestContext(acceptCtx)
@@ -616,13 +799,20 @@ func RunSocketMode(acceptCtx, turnCtx context.Context, botToken, appToken string
 			if !ok {
 				continue
 			}
-			mention, ok := apiEvent.InnerEvent.Data.(*slackevents.AppMentionEvent)
-			if !ok {
-				continue
+			switch innerEvent := apiEvent.InnerEvent.Data.(type) {
+			case *slackevents.AppMentionEvent:
+				workflowID := ""
+				if event.Request != nil {
+					workflowID = workflowIDFromPayload(event.Request.Payload)
+				}
+				wg.Go(func() {
+					bot.handleMention(turnCtx, innerEvent, workflowID)
+				})
+			case *slackevents.MessageEvent:
+				wg.Go(func() {
+					bot.HandleMessage(turnCtx, innerEvent)
+				})
 			}
-			wg.Go(func() {
-				bot.HandleMention(turnCtx, mention)
-			})
 		}
 	}
 }

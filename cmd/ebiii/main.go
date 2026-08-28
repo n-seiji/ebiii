@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -42,16 +43,21 @@ func main() {
 	runner := &codex.Runner{
 		Command:               cfg.CodexCommand,
 		Model:                 cfg.CodexModel,
+		ConfigPath:            filepath.Join(cfg.EBIIIHome, ".codex", "config.toml"),
 		DeniedReadPaths:       []string{cfg.MemoryDir},
 		DeveloperInstructions: policy.Instructions(),
 	}
 	bot := slackbot.New(nil, store, runner, slackbot.Config{
-		AllowedUserIDs:    cfg.AllowedUserIDs,
-		AllowedChannelIDs: cfg.AllowedChannelIDs,
-		WorkspaceDir:      cfg.WorkspaceDir,
-		MemoryDir:         cfg.MemoryDir,
-		CodexTimeout:      cfg.CodexTimeout,
-		WritableRoots:     cfg.WritableRoots,
+		AllowedUserIDs:             cfg.AllowedUserIDs,
+		AllowedChannelIDs:          cfg.AllowedChannelIDs,
+		AllowWorkflows:             cfg.AllowWorkflows,
+		AdminUserID:                cfg.AdminUserID,
+		WorkspaceDir:               cfg.WorkspaceDir,
+		MemoryDir:                  cfg.MemoryDir,
+		CodexTimeout:               cfg.CodexTimeout,
+		ThreadSubscriptionReaction: cfg.ThreadSubscriptionReaction,
+		ThreadSubscriptionTTL:      cfg.ThreadSubscriptionTTL,
+		WritableRoots:              cfg.WritableRoots,
 	}, playbooks)
 
 	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

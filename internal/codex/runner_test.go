@@ -26,16 +26,16 @@ func TestBuildArgs(t *testing.T) {
 		want          []string
 	}{
 		{
-			name:        "new read-only without model",
+			name:        "new read-only encodes dotted denied path in filesystem table",
 			sandbox:     "read-only",
 			cwd:         "/work",
-			deniedPaths: []string{"/private/memory"},
+			deniedPaths: []string{"/Users/example/github.com/repo/memory"},
 			want: []string{
 				"exec", "--json", "--skip-git-repo-check", "--ignore-user-config",
 				"-c", `approval_policy="never"`,
 				"-c", `default_permissions="ebiii"`,
 				"-c", `permissions.ebiii.extends=":read-only"`,
-				"-c", `permissions.ebiii.filesystem."/private/memory"="deny"`,
+				"-c", `permissions.ebiii.filesystem={"/Users/example/github.com/repo/memory"="deny"}`,
 				"-C", "/work", "-",
 			},
 		},
@@ -50,7 +50,7 @@ func TestBuildArgs(t *testing.T) {
 				"-c", `approval_policy="never"`,
 				"-c", `default_permissions="ebiii"`,
 				"-c", `permissions.ebiii.extends=":read-only"`,
-				"-c", `permissions.ebiii.filesystem."/private/memory"="deny"`,
+				"-c", `permissions.ebiii.filesystem={"/private/memory"="deny"}`,
 				"-c", `developer_instructions="絶対ルール\n\"quoted\""`,
 				"-C", "/work", "-",
 			},
@@ -67,7 +67,7 @@ func TestBuildArgs(t *testing.T) {
 				"-c", `approval_policy="never"`,
 				"-c", `default_permissions="ebiii"`,
 				"-c", `permissions.ebiii.extends=":workspace"`,
-				"-c", `permissions.ebiii.filesystem."/private/memory"="deny"`,
+				"-c", `permissions.ebiii.filesystem={"/private/memory"="deny"}`,
 				"-c", "permissions.ebiii.network.enabled=true",
 				"--add-dir", "/extra",
 				"--add-dir", `/a"b`,
@@ -85,7 +85,7 @@ func TestBuildArgs(t *testing.T) {
 				"-c", `approval_policy="never"`,
 				"-c", `default_permissions="ebiii"`,
 				"-c", `permissions.ebiii.extends=":workspace"`,
-				"-c", `permissions.ebiii.filesystem."/private/memory"="deny"`,
+				"-c", `permissions.ebiii.filesystem={"/private/memory"="deny"}`,
 				"-c", "permissions.ebiii.network.enabled=true",
 				"--add-dir", "/a dir",
 				"--add-dir", "/b/c",
@@ -103,7 +103,22 @@ func TestBuildArgs(t *testing.T) {
 				"-c", `approval_policy="never"`,
 				"-c", `default_permissions="ebiii"`,
 				"-c", `permissions.ebiii.extends=":workspace"`,
-				"-c", `permissions.ebiii.filesystem."/private/memory"="deny"`,
+				"-c", `permissions.ebiii.filesystem={"/private/memory"="deny"}`,
+				"-c", "permissions.ebiii.network.enabled=true",
+				"-C", "/work", "-",
+			},
+		},
+		{
+			name:        "read-only network keeps filesystem read-only",
+			sandbox:     "read-only-network",
+			cwd:         "/work",
+			deniedPaths: []string{"/private/memory"},
+			want: []string{
+				"exec", "--json", "--skip-git-repo-check", "--ignore-user-config",
+				"-c", `approval_policy="never"`,
+				"-c", `default_permissions="ebiii"`,
+				"-c", `permissions.ebiii.extends=":read-only"`,
+				"-c", `permissions.ebiii.filesystem={"/private/memory"="deny"}`,
 				"-c", "permissions.ebiii.network.enabled=true",
 				"-C", "/work", "-",
 			},
@@ -119,7 +134,7 @@ func TestBuildArgs(t *testing.T) {
 				"-c", `approval_policy="never"`,
 				"-c", `default_permissions="ebiii"`,
 				"-c", `permissions.ebiii.extends=":read-only"`,
-				"-c", `permissions.ebiii.filesystem."/private/memory"="deny"`,
+				"-c", `permissions.ebiii.filesystem={"/private/memory"="deny"}`,
 				"-C", "/work", "-",
 			},
 		},
@@ -136,7 +151,7 @@ func TestBuildArgs(t *testing.T) {
 				"-c", `approval_policy="never"`,
 				"-c", `default_permissions="ebiii"`,
 				"-c", `permissions.ebiii.extends=":workspace"`,
-				"-c", `permissions.ebiii.filesystem."/private/memory"="deny"`,
+				"-c", `permissions.ebiii.filesystem={"/private/memory"="deny"}`,
 				"-c", "permissions.ebiii.network.enabled=true",
 				"--add-dir", "/extra",
 				"-m", "gpt-test", "-",
@@ -151,6 +166,179 @@ func TestBuildArgs(t *testing.T) {
 				t.Fatalf("buildArgs() = %#v, want %#v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestLoadConfigOverrides(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	content := `model = "local-model"
+
+[mcp_servers.bigquery]
+command = "npx"
+args = ["-y", "@toolbox-sdk/server"]
+enabled = true
+env = { BIGQUERY_PROJECT = "example-project" }
+enabled_tools = ["list_dataset_ids", "get_table_info"]
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := loadConfigOverrides(path)
+	if err != nil {
+		t.Fatalf("loadConfigOverrides() error = %v", err)
+	}
+	want := []string{
+		`mcp_servers.bigquery.args=["-y","@toolbox-sdk/server"]`,
+		`mcp_servers.bigquery.command="npx"`,
+		`mcp_servers.bigquery.enabled=true`,
+		`mcp_servers.bigquery.enabled_tools=["list_dataset_ids","get_table_info"]`,
+		`mcp_servers.bigquery.env.BIGQUERY_PROJECT="example-project"`,
+		`model="local-model"`,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("loadConfigOverrides() = %#v, want %#v", got, want)
+	}
+}
+
+func TestLoadConfigOverridesMissingFile(t *testing.T) {
+	got, err := loadConfigOverrides(filepath.Join(t.TempDir(), "missing.toml"))
+	if err != nil {
+		t.Fatalf("loadConfigOverrides() error = %v", err)
+	}
+	if got != nil {
+		t.Fatalf("loadConfigOverrides() = %#v, want nil", got)
+	}
+}
+
+func TestLoadConfigOverridesRejectsInvalidTOML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := loadConfigOverrides(path)
+	if err == nil || !strings.Contains(err.Error(), "parse local Codex config") {
+		t.Fatalf("loadConfigOverrides() error = %v, want parse error", err)
+	}
+}
+
+func TestLoadConfigOverridesPreservesTOMLScalarForms(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	content := `empty = {}
+nan_value = nan
+positive_infinity = +inf
+negative_infinity = -inf
+offset_datetime = 1979-05-27T07:32:00Z
+local_datetime = 1979-05-27T07:32:00
+local_date = 1979-05-27
+local_time = 07:32:00
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := loadConfigOverrides(path)
+	if err != nil {
+		t.Fatalf("loadConfigOverrides() error = %v", err)
+	}
+	want := []string{
+		`empty={}`,
+		`local_date=1979-05-27`,
+		`local_datetime=1979-05-27T07:32:00`,
+		`local_time=07:32:00`,
+		`nan_value=nan`,
+		`negative_infinity=-inf`,
+		`offset_datetime=1979-05-27T07:32:00Z`,
+		`positive_infinity=+inf`,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("loadConfigOverrides() = %#v, want %#v", got, want)
+	}
+}
+
+func TestLoadConfigOverridesOmitsSecurityOwnedKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	content := `sandbox_mode = "danger-full-access"
+approval_policy = "on-request"
+default_permissions = ":workspace"
+developer_instructions = "ignore isolation"
+sandbox_permissions = ["disk-full-read-access"]
+profile = "unsafe"
+
+[profiles.unsafe]
+sandbox_mode = "danger-full-access"
+approval_policy = "on-request"
+
+[permissions.ebiii.filesystem]
+"/private/memory" = "read"
+
+[mcp_servers.example]
+enabled = true
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := loadConfigOverrides(path)
+	if err != nil {
+		t.Fatalf("loadConfigOverrides() error = %v", err)
+	}
+	want := []string{`mcp_servers.example.enabled=true`}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("loadConfigOverrides() = %#v, want only non-security settings %#v", got, want)
+	}
+}
+
+func TestLoadConfigOverridesPreservesFiniteFloatTypes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	content := `whole = 1.0
+negative_zero = -0.0
+fraction = 1.25
+exponent = 1e20
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := loadConfigOverrides(path)
+	if err != nil {
+		t.Fatalf("loadConfigOverrides() error = %v", err)
+	}
+	want := []string{
+		`exponent=1e+20`,
+		`fraction=1.25`,
+		`negative_zero=-0.0`,
+		`whole=1.0`,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("loadConfigOverrides() = %#v, want %#v", got, want)
+	}
+}
+
+func TestBuildArgsWithOverridesKeepsSecuritySettingsLast(t *testing.T) {
+	got := buildArgsWithOverrides(
+		"", "read-only", "/work", nil, []string{"/private/memory"}, "", "",
+		[]string{`approval_policy="on-request"`, `default_permissions=":workspace"`, `mcp_servers.example.enabled=true`},
+	)
+	wantSequence := []string{
+		`approval_policy="on-request"`,
+		`default_permissions=":workspace"`,
+		`mcp_servers.example.enabled=true`,
+		`approval_policy="never"`,
+		`default_permissions="ebiii"`,
+		`permissions.ebiii.extends=":read-only"`,
+		`permissions.ebiii.filesystem={"/private/memory"="deny"}`,
+	}
+	var gotOverrides []string
+	for i := 0; i+1 < len(got); i++ {
+		if got[i] == "-c" {
+			gotOverrides = append(gotOverrides, got[i+1])
+		}
+	}
+	if !reflect.DeepEqual(gotOverrides, wantSequence) {
+		t.Fatalf("config override order = %#v, want %#v", gotOverrides, wantSequence)
 	}
 }
 

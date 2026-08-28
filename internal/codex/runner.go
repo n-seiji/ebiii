@@ -27,6 +27,9 @@ const (
 type Runner struct {
 	Command string
 	Model   string
+	// ConfigPath is a local project config whose values are forwarded as CLI
+	// overrides while the global user config remains disabled.
+	ConfigPath string
 	// DeniedReadPaths are protected backing stores that model-generated
 	// commands must not read or write. They are enforced with a Codex
 	// permission profile, independently of prompt instructions.
@@ -54,7 +57,11 @@ func (r *Runner) Run(
 	prompt string,
 	onThreadStarted func(id string) error,
 ) (*TurnResult, error) {
-	args := buildArgs(threadID, sandbox, cwd, writableRoots, r.DeniedReadPaths, r.Model, r.DeveloperInstructions)
+	configOverrides, err := loadConfigOverrides(r.ConfigPath)
+	if err != nil {
+		return nil, err
+	}
+	args := buildArgsWithOverrides(threadID, sandbox, cwd, writableRoots, r.DeniedReadPaths, r.Model, r.DeveloperInstructions, configOverrides)
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -101,6 +108,10 @@ func (r *Runner) Run(
 }
 
 func buildArgs(threadID, sandbox, cwd string, writableRoots, deniedReadPaths []string, model, developerInstructions string) []string {
+	return buildArgsWithOverrides(threadID, sandbox, cwd, writableRoots, deniedReadPaths, model, developerInstructions, nil)
+}
+
+func buildArgsWithOverrides(threadID, sandbox, cwd string, writableRoots, deniedReadPaths []string, model, developerInstructions string, configOverrides []string) []string {
 	args := []string{"exec"}
 	if threadID != "" {
 		args = append(args, "resume", threadID)
@@ -112,22 +123,32 @@ func buildArgs(threadID, sandbox, cwd string, writableRoots, deniedReadPaths []s
 		// profiles. Ignore it so the deny rules below cannot be weakened by
 		// machine-local Codex settings; authentication still uses CODEX_HOME.
 		"--ignore-user-config",
-		"-c", `approval_policy="never"`,
-		"-c", `default_permissions="ebiii"`,
 	)
+	for _, override := range configOverrides {
+		args = append(args, "-c", override)
+	}
+	// Security invariants come after local values so local configuration can
+	// never weaken them.
+	args = append(args, "-c", `approval_policy="never"`, "-c", `default_permissions="ebiii"`)
 	parentProfile := ":read-only"
 	if sandbox == "workspace-write" {
 		parentProfile = ":workspace"
 	}
 	args = append(args, "-c", "permissions.ebiii.extends="+strconv.Quote(parentProfile))
-	for _, path := range deniedReadPaths {
-		args = append(args, "-c", "permissions.ebiii.filesystem."+strconv.Quote(path)+`="deny"`)
+	if len(deniedReadPaths) > 0 {
+		entries := make([]string, 0, len(deniedReadPaths))
+		for _, path := range deniedReadPaths {
+			entries = append(entries, strconv.Quote(path)+`="deny"`)
+		}
+		args = append(args, "-c", "permissions.ebiii.filesystem={"+strings.Join(entries, ",")+"}")
 	}
 	if developerInstructions != "" {
 		args = append(args, "-c", "developer_instructions="+strconv.Quote(developerInstructions))
 	}
-	if sandbox == "workspace-write" {
+	if sandbox == "workspace-write" || sandbox == "read-only-network" {
 		args = append(args, "-c", "permissions.ebiii.network.enabled=true")
+	}
+	if sandbox == "workspace-write" {
 		for _, root := range writableRoots {
 			args = append(args, "--add-dir", root)
 		}

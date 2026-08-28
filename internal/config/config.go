@@ -7,27 +7,37 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
 )
 
-const defaultCodexTimeout = 30 * time.Minute
+const (
+	defaultCodexTimeout               = 30 * time.Minute
+	defaultThreadSubscriptionReaction = "thread-subete"
+	defaultThreadSubscriptionTTL      = 336 * time.Hour
+)
 
 // Config contains ebiii's runtime configuration and resolved data paths.
 type Config struct {
-	SlackBotToken     string
-	SlackAppToken     string
-	AllowedUserIDs    []string
-	AllowedChannelIDs []string
-	CodexCommand      string
-	CodexModel        string
-	CodexTimeout      time.Duration
-	EBIIIHome         string
-	WorkspaceDir      string
-	MemoryDir         string
-	PlaybooksDir      string
-	StateDir          string
+	SlackBotToken              string
+	SlackAppToken              string
+	AllowedUserIDs             []string
+	AllowedChannelIDs          []string
+	AllowWorkflows             bool
+	AdminUserID                string
+	CodexCommand               string
+	CodexModel                 string
+	CodexTimeout               time.Duration
+	ThreadSubscriptionReaction string
+	ThreadSubscriptionTTL      time.Duration
+	EBIIIHome                  string
+	WorkspaceDir               string
+	MemoryDir                  string
+	PlaybooksDir               string
+	StateDir                   string
 	// WritableRoots are absolute, symlink-resolved directories the work turn
 	// may write to in addition to the workspace.
 	WritableRoots []string
@@ -60,6 +70,17 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("SLACK_ALLOWED_USER_IDS: invalid user ID %q: %w", userID, errors.New("must start with U"))
 		}
 	}
+	allowWorkflows := false
+	if value := strings.TrimSpace(os.Getenv("SLACK_ALLOW_WORKFLOWS")); value != "" {
+		allowWorkflows, err = strconv.ParseBool(value)
+		if err != nil {
+			return nil, fmt.Errorf("SLACK_ALLOW_WORKFLOWS %q: %w", value, err)
+		}
+	}
+	adminUserID := strings.TrimSpace(os.Getenv("SLACK_ADMIN_USER_ID"))
+	if adminUserID != "" && !strings.HasPrefix(adminUserID, "U") {
+		return nil, fmt.Errorf("SLACK_ADMIN_USER_ID: invalid user ID %q: %w", adminUserID, errors.New("must start with U"))
+	}
 
 	codexCommand := os.Getenv("CODEX_COMMAND")
 	if codexCommand == "" {
@@ -74,6 +95,20 @@ func Load() (*Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("CODEX_TIMEOUT %q: %w", value, err)
 		}
+	}
+	threadSubscriptionReaction := defaultThreadSubscriptionReaction
+	if value, exists := os.LookupEnv("SLACK_THREAD_SUBSCRIPTION_REACTION"); exists {
+		threadSubscriptionReaction = strings.TrimSpace(value)
+	}
+	threadSubscriptionTTL := defaultThreadSubscriptionTTL
+	if value := strings.TrimSpace(os.Getenv("SLACK_THREAD_SUBSCRIPTION_TTL")); value != "" {
+		threadSubscriptionTTL, err = time.ParseDuration(value)
+		if err != nil {
+			return nil, fmt.Errorf("SLACK_THREAD_SUBSCRIPTION_TTL %q: %w", value, err)
+		}
+	}
+	if threadSubscriptionReaction != "" && threadSubscriptionTTL <= 0 {
+		return nil, fmt.Errorf("SLACK_THREAD_SUBSCRIPTION_TTL %q: %w", os.Getenv("SLACK_THREAD_SUBSCRIPTION_TTL"), errors.New("must be positive when subscriptions are enabled"))
 	}
 
 	home := strings.TrimSpace(os.Getenv("EBIII_HOME"))
@@ -97,19 +132,23 @@ func Load() (*Config, error) {
 	}
 
 	return &Config{
-		SlackBotToken:     botToken,
-		SlackAppToken:     appToken,
-		AllowedUserIDs:    userIDs,
-		AllowedChannelIDs: splitList(os.Getenv("SLACK_ALLOWED_CHANNEL_IDS")),
-		CodexCommand:      codexCommand,
-		CodexModel:        strings.TrimSpace(os.Getenv("CODEX_MODEL")),
-		CodexTimeout:      codexTimeout,
-		EBIIIHome:         home,
-		WorkspaceDir:      workspaceDir,
-		MemoryDir:         memoryDir,
-		PlaybooksDir:      filepath.Join(home, "data", "playbooks"),
-		StateDir:          filepath.Join(home, "data", "state"),
-		WritableRoots:     writableRoots,
+		SlackBotToken:              botToken,
+		SlackAppToken:              appToken,
+		AllowedUserIDs:             userIDs,
+		AllowedChannelIDs:          splitList(os.Getenv("SLACK_ALLOWED_CHANNEL_IDS")),
+		AllowWorkflows:             allowWorkflows,
+		AdminUserID:                adminUserID,
+		CodexCommand:               codexCommand,
+		CodexModel:                 strings.TrimSpace(os.Getenv("CODEX_MODEL")),
+		CodexTimeout:               codexTimeout,
+		ThreadSubscriptionReaction: threadSubscriptionReaction,
+		ThreadSubscriptionTTL:      threadSubscriptionTTL,
+		EBIIIHome:                  home,
+		WorkspaceDir:               workspaceDir,
+		MemoryDir:                  memoryDir,
+		PlaybooksDir:               filepath.Join(home, "data", "playbooks"),
+		StateDir:                   filepath.Join(home, "data", "state"),
+		WritableRoots:              writableRoots,
 	}, nil
 }
 
@@ -149,8 +188,8 @@ func canonicalPath(path string) (string, error) {
 	for {
 		resolved, err := filepath.EvalSymlinks(current)
 		if err == nil {
-			for i := len(missing) - 1; i >= 0; i-- {
-				resolved = filepath.Join(resolved, missing[i])
+			for _, m := range slices.Backward(missing) {
+				resolved = filepath.Join(resolved, m)
 			}
 			return filepath.Clean(resolved), nil
 		}

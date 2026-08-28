@@ -200,6 +200,218 @@ func TestGC(t *testing.T) {
 	}
 }
 
+func TestSubscriptionLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v, want nil", err)
+	}
+
+	startedAt := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	expiresAt := startedAt.Add(24 * time.Hour)
+	if err := store.SetSubscription("C123:500.001", startedAt, expiresAt); err != nil {
+		t.Fatalf("SetSubscription() error = %v, want nil", err)
+	}
+	if got, ok := store.GetSubscription("C123:500.001"); !ok || got != (Subscription{StartedAt: startedAt, ExpiresAt: expiresAt}) {
+		t.Errorf("GetSubscription() = (%+v, %v), want (%+v, true)", got, ok, Subscription{StartedAt: startedAt, ExpiresAt: expiresAt})
+	}
+
+	renewedAt := expiresAt.Add(24 * time.Hour)
+	if err := store.SetSubscription("C123:500.001", startedAt, renewedAt); err != nil {
+		t.Fatalf("SetSubscription() renewal error = %v, want nil", err)
+	}
+
+	reloaded, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore() after subscription writes error = %v, want nil", err)
+	}
+	if got, ok := reloaded.GetSubscription("C123:500.001"); !ok || got != (Subscription{StartedAt: startedAt, ExpiresAt: renewedAt}) {
+		t.Errorf("reloaded GetSubscription() = (%+v, %v), want (%+v, true)", got, ok, Subscription{StartedAt: startedAt, ExpiresAt: renewedAt})
+	}
+
+	if err := reloaded.DeleteSubscription("C123:500.001"); err != nil {
+		t.Fatalf("DeleteSubscription() error = %v, want nil", err)
+	}
+	if _, ok := reloaded.GetSubscription("C123:500.001"); ok {
+		t.Error("GetSubscription() after DeleteSubscription() found a subscription, want none")
+	}
+	reloaded, err = NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore() after DeleteSubscription() error = %v, want nil", err)
+	}
+	if _, ok := reloaded.GetSubscription("C123:500.001"); ok {
+		t.Error("reloaded GetSubscription() after DeleteSubscription() found a subscription, want none")
+	}
+}
+
+func TestDeleteSubscriptionIfExpired(t *testing.T) {
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name        string
+		expiresAt   *time.Time
+		wantDeleted bool
+		wantFound   bool
+	}{
+		{name: "missing", wantDeleted: false, wantFound: false},
+		{name: "active", expiresAt: new(now.Add(time.Second)), wantDeleted: false, wantFound: true},
+		{name: "boundary", expiresAt: new(now), wantDeleted: true, wantFound: false},
+		{name: "expired", expiresAt: new(now.Add(-time.Second)), wantDeleted: true, wantFound: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			store, err := NewStore(dir)
+			if err != nil {
+				t.Fatalf("NewStore() error = %v, want nil", err)
+			}
+			const key = "C123:550.001"
+			if test.expiresAt != nil {
+				if err := store.SetSubscription(key, now.Add(-time.Hour), *test.expiresAt); err != nil {
+					t.Fatalf("SetSubscription() error = %v, want nil", err)
+				}
+			}
+
+			deleted, err := store.DeleteSubscriptionIfExpired(key, now)
+			if err != nil {
+				t.Fatalf("DeleteSubscriptionIfExpired() error = %v, want nil", err)
+			}
+			if deleted != test.wantDeleted {
+				t.Errorf("DeleteSubscriptionIfExpired() deleted = %v, want %v", deleted, test.wantDeleted)
+			}
+			_, found := store.GetSubscription(key)
+			if found != test.wantFound {
+				t.Errorf("GetSubscription() found = %v after conditional delete, want %v", found, test.wantFound)
+			}
+
+			reloaded, err := NewStore(dir)
+			if err != nil {
+				t.Fatalf("NewStore() after conditional delete error = %v, want nil", err)
+			}
+			_, found = reloaded.GetSubscription(key)
+			if found != test.wantFound {
+				t.Errorf("reloaded GetSubscription() found = %v, want %v", found, test.wantFound)
+			}
+		})
+	}
+}
+
+func TestDeleteSubscriptionIfExpiredRollsBackAfterSaveFailure(t *testing.T) {
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	store := newTestStore(t)
+	const key = "C123:550.002"
+	want := Subscription{StartedAt: now.Add(-time.Hour), ExpiresAt: now}
+	if err := store.SetSubscription(key, want.StartedAt, want.ExpiresAt); err != nil {
+		t.Fatalf("SetSubscription() error = %v, want nil", err)
+	}
+	restore := blockStateDirectory(t, store.dir)
+
+	deleted, err := store.DeleteSubscriptionIfExpired(key, now)
+	if err == nil {
+		t.Fatal("DeleteSubscriptionIfExpired() error = nil, want non-nil")
+	}
+	if deleted {
+		t.Fatal("DeleteSubscriptionIfExpired() deleted = true after save failure, want false")
+	}
+	if got, ok := store.GetSubscription(key); !ok || got != want {
+		t.Fatalf("subscription after save failure = (%+v, %v), want rollback (%+v, true)", got, ok, want)
+	}
+
+	restore()
+	deleted, err = store.DeleteSubscriptionIfExpired(key, now)
+	if err != nil || !deleted {
+		t.Fatalf("DeleteSubscriptionIfExpired() after restore = (%v, %v), want (true, nil)", deleted, err)
+	}
+}
+
+func TestGCRemovesExpiredSubscriptions(t *testing.T) {
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v, want nil", err)
+	}
+	if err := store.SetSubscription("C123:600.001", now.Add(-2*time.Hour), now.Add(-time.Second)); err != nil {
+		t.Fatalf("SetSubscription() expired error = %v, want nil", err)
+	}
+	if err := store.SetSubscription("C123:600.002", now.Add(-time.Hour), now); err != nil {
+		t.Fatalf("SetSubscription() boundary error = %v, want nil", err)
+	}
+	if err := store.SetSubscription("C123:600.003", now, now.Add(time.Hour)); err != nil {
+		t.Fatalf("SetSubscription() active error = %v, want nil", err)
+	}
+
+	if err := store.GC(now, 7*24*time.Hour); err != nil {
+		t.Fatalf("GC() error = %v, want nil", err)
+	}
+
+	reloaded, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore() after GC error = %v, want nil", err)
+	}
+	if _, ok := reloaded.GetSubscription("C123:600.001"); ok {
+		t.Error("GC() retained expired subscription, want removed")
+	}
+	if _, ok := reloaded.GetSubscription("C123:600.002"); ok {
+		t.Error("GC() retained boundary-expired subscription, want removed")
+	}
+	if _, ok := reloaded.GetSubscription("C123:600.003"); !ok {
+		t.Error("GC() removed active subscription, want retained")
+	}
+}
+
+func TestGCKeepsEventCleanupAfterSubscriptionSaveFailure(t *testing.T) {
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v, want nil", err)
+	}
+	store.events["C123:700.001"] = event{State: Done, UpdatedAt: now.Add(-8 * 24 * time.Hour)}
+	if err := store.saveEvents(); err != nil {
+		t.Fatalf("saveEvents() setup error = %v, want nil", err)
+	}
+	if err := store.SetSubscription("C123:700.002", now.Add(-time.Hour), now.Add(-time.Second)); err != nil {
+		t.Fatalf("SetSubscription() setup error = %v, want nil", err)
+	}
+
+	subscriptionsPath := filepath.Join(dir, subscriptionsFilename)
+	if err := os.Remove(subscriptionsPath); err != nil {
+		t.Fatalf("Remove() subscriptions file error = %v, want nil", err)
+	}
+	if err := os.Mkdir(subscriptionsPath, 0o700); err != nil {
+		t.Fatalf("Mkdir() subscriptions blocker error = %v, want nil", err)
+	}
+
+	err = store.GC(now, 7*24*time.Hour)
+	if err == nil {
+		t.Fatal("GC() error = nil, want non-nil")
+	}
+	if _, ok := store.events["C123:700.001"]; ok {
+		t.Error("GC() restored an event whose cleanup was already saved")
+	}
+	if _, ok := store.GetSubscription("C123:700.002"); !ok {
+		t.Error("GC() did not restore the subscription whose save failed")
+	}
+
+	if err := os.Remove(subscriptionsPath); err != nil {
+		t.Fatalf("Remove() subscriptions blocker error = %v, want nil", err)
+	}
+	if err := store.GC(now, 7*24*time.Hour); err != nil {
+		t.Fatalf("GC() retry error = %v, want nil", err)
+	}
+	reloaded, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore() after GC retry error = %v, want nil", err)
+	}
+	if _, ok := reloaded.events["C123:700.001"]; ok {
+		t.Error("reloaded event found after GC cleanup, want none")
+	}
+	if _, ok := reloaded.GetSubscription("C123:700.002"); ok {
+		t.Error("reloaded subscription found after GC retry, want none")
+	}
+}
+
 func TestNewStoreRejectsCorruptJSON(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -261,6 +473,11 @@ func newTestStore(t *testing.T) *Store {
 		t.Fatalf("NewStore() error = %v, want nil", err)
 	}
 	return store
+}
+
+//go:fix inline
+func timePointer(value time.Time) *time.Time {
+	return new(value)
 }
 
 func mustClaim(t *testing.T, store *Store, key string) {

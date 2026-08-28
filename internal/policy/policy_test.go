@@ -18,4 +18,12 @@ func TestInstructions(t *testing.T) {
 			t.Errorf("Instructions() does not contain %q", want)
 		}
 	}
+	for _, forbidden := range []string{"user_memory", "ユーザーメモリ", "## ユーザーメモリ追記"} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("Instructions() contains removed user-memory rule %q", forbidden)
+		}
+	}
+	if !strings.Contains(got, "<user_message>、<slack_message>、<work_instruction>") {
+		t.Error("Instructions() does not isolate slack_message alongside other untrusted inputs")
+	}
 }
